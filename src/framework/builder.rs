@@ -33,6 +33,17 @@ pub struct FrameworkBuilder<U, E> {
         crate::CommandDefinition<U, E>,
         Box<dyn FnOnce(&mut crate::CommandBuilder<U, E>) -> &mut crate::CommandBuilder<U, E>>,
     )>,
+    on_message: Option<
+        Box<
+            dyn Send
+                + Sync
+                + for<'a> FnMut(
+                    &'a serenity::Context,
+                    &'a serenity::Message,
+                    &'a crate::Framework<U, E>,
+                ) -> BoxFuture<'a, Result<U, E>>,
+        >,
+    >,
 }
 
 impl<U, E> Default for FrameworkBuilder<U, E> {
@@ -45,6 +56,7 @@ impl<U, E> Default for FrameworkBuilder<U, E> {
             token: Default::default(),
             intents: Default::default(),
             commands: Default::default(),
+            on_message: Default::default(),
         }
     }
 }
@@ -69,6 +81,22 @@ impl<U, E> FrameworkBuilder<U, E> {
             ) -> BoxFuture<'a, Result<U, E>>,
     {
         self.user_data_setup = Some(Box::new(user_data_setup) as _);
+        self
+    }
+
+    /// Set message callback
+    pub fn on_message<F>(mut self, on_message: F) -> Self
+    where
+        F: Send
+            + Sync
+            + 'static
+            + for<'a> FnMut(
+                &'a serenity::Context,
+                &'a serenity::Message,
+                &'a crate::Framework<U, E>,
+            ) -> BoxFuture<'a,  Result<U, E>>,
+    {
+        self.on_message = Some(Box::new(on_message));
         self
     }
 
@@ -129,6 +157,7 @@ impl<U, E> FrameworkBuilder<U, E> {
         let user_data_setup = self
             .user_data_setup
             .expect("No user data setup function was provided to the framework");
+        let on_message = self.on_message.unwrap();
         let mut options = self.options.expect("No framework options provided");
 
         // Retrieve application info via HTTP
@@ -152,6 +181,7 @@ impl<U, E> FrameworkBuilder<U, E> {
                 .bot_user_id,
             options,
             application_id: serenity::ApplicationId(application_info.id.0),
+            on_message: std::sync::Mutex::new(Some(on_message)),
         };
 
         // Create serenity client

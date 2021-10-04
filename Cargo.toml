@@ -17,9 +17,11 @@ poise_macros = { path = "macros" }
 async-trait = "0.1.48" # PopArgumentAsync trait
 regex = "1.5.4" # prefix
 
+songbird = { path = "../songbird" }
+
 [dependencies.serenity]
 default-features = false
-features = ["builder", "cache", "client", "gateway", "model", "utils", "rustls_backend", "unstable_discord_api"]
+features = ["builder", "cache", "client", "gateway", "model", "utils", "rustls_backend", "unstable_discord_api", "voice"]
 
 # version = "0.10.5"
 

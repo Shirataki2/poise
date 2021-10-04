@@ -97,6 +97,19 @@ pub struct Framework<U, E> {
     // the edit tracking cache interior mutability
     options: FrameworkOptions<U, E>,
     application_id: serenity::ApplicationId,
+    on_message: std::sync::Mutex<
+        Option<
+            Box<
+                dyn Send
+                    + Sync
+                    + for<'a> FnMut(
+                        &'a serenity::Context,
+                        &'a serenity::Message,
+                        &'a Self,
+                    ) -> BoxFuture<'a, Result<U, E>>,
+            >,
+        >,
+    >
 }
 
 impl<U, E> Framework<U, E> {
@@ -107,45 +120,45 @@ impl<U, E> Framework<U, E> {
         FrameworkBuilder::default()
     }
 
-    /// Setup a new [`Framework`]
-    ///
-    /// Takes several arguments:
-    /// - the prefix used for parsing commands from messages
-    /// - the Discord application ID (required for slash commands)
-    /// - a callback to create user data
-    /// - framework configuration via [`FrameworkOptions`]
-    ///
-    /// The user data callback is invoked as soon as the bot is logged in. That way, bot data like
-    /// user ID or connected guilds can be made available to the user data setup function. The user
-    /// data setup is not allowed to return Result because there would be no reasonable
-    /// course of action on error.
-    #[deprecated = "use Framework::build() instead"]
-    pub fn new<F>(
-        prefix: impl Into<String>,
-        application_id: serenity::ApplicationId,
-        bot_id: serenity::UserId,
-        user_data_setup: F,
-        options: FrameworkOptions<U, E>,
-    ) -> Self
-    where
-        F: Send
-            + Sync
-            + 'static
-            + for<'a> FnOnce(
-                &'a serenity::Context,
-                &'a serenity::Ready,
-                &'a Self,
-            ) -> BoxFuture<'a, Result<U, E>>,
-    {
-        Self {
-            prefix: prefix.into(),
-            user_data: once_cell::sync::OnceCell::new(),
-            user_data_setup: std::sync::Mutex::new(Some(Box::new(user_data_setup))),
-            bot_id,
-            options,
-            application_id,
-        }
-    }
+    // /// Setup a new [`Framework`]
+    // ///
+    // /// Takes several arguments:
+    // /// - the prefix used for parsing commands from messages
+    // /// - the Discord application ID (required for slash commands)
+    // /// - a callback to create user data
+    // /// - framework configuration via [`FrameworkOptions`]
+    // ///
+    // /// The user data callback is invoked as soon as the bot is logged in. That way, bot data like
+    // /// user ID or connected guilds can be made available to the user data setup function. The user
+    // /// data setup is not allowed to return Result because there would be no reasonable
+    // /// course of action on error.
+    // #[deprecated = "use Framework::build() instead"]
+    // pub fn new<F>(
+    //     prefix: impl Into<String>,
+    //     application_id: serenity::ApplicationId,
+    //     bot_id: serenity::UserId,
+    //     user_data_setup: F,
+    //     options: FrameworkOptions<U, E>,
+    // ) -> Self
+    // where
+    //     F: Send
+    //         + Sync
+    //         + 'static
+    //         + for<'a> FnOnce(
+    //             &'a serenity::Context,
+    //             &'a serenity::Ready,
+    //             &'a Self,
+    //         ) -> BoxFuture<'a, Result<U, E>>,
+    // {
+    //     Self {
+    //         prefix: prefix.into(),
+    //         user_data: once_cell::sync::OnceCell::new(),
+    //         user_data_setup: std::sync::Mutex::new(Some(Box::new(user_data_setup))),
+    //         bot_id,
+    //         options,
+    //         application_id,
+    //     }
+    // }
 
     /// Start the framework.
     ///
@@ -156,6 +169,10 @@ impl<U, E> Framework<U, E> {
         U: Send + Sync + 'static,
         E: 'static + Send,
     {
+        use songbird::register;
+
+        let builder = register(builder);
+
         let application_id = self.application_id;
 
         let self_1 = std::sync::Arc::new(self);
@@ -246,6 +263,12 @@ impl<U, E> Framework<U, E> {
                             crate::ErrorContext::Command(crate::CommandErrorContext::Prefix(ctx)),
                         )
                         .await;
+                    }
+                }
+                let on_message = Option::take(&mut *self.on_message.lock().unwrap());
+                if let Some(mut on_message) = on_message {
+                    if let Err(_) = (on_message)(&ctx, new_message, self).await {
+                        println!("Error occured in on_message");
                     }
                 }
             }
