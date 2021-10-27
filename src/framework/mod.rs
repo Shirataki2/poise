@@ -5,10 +5,14 @@ mod prefix;
 mod slash;
 
 mod builder;
+
 pub use builder::*;
 
+use crate::serenity::client::{bridge::gateway::ShardManager, Client};
 use crate::serenity_prelude as serenity;
 use crate::*;
+
+pub use prefix::dispatch_message;
 
 async fn check_permissions<U, E>(
     ctx: crate::Context<'_, U, E>,
@@ -77,7 +81,6 @@ async fn check_required_permissions_and_owners_only<U, E>(
 
 /// The main framework struct which stores all data and handles message and interaction dispatch.
 pub struct Framework<U, E> {
-    prefix: String,
     user_data: once_cell::sync::OnceCell<U>,
     user_data_setup: std::sync::Mutex<
         Option<
@@ -97,19 +100,7 @@ pub struct Framework<U, E> {
     // the edit tracking cache interior mutability
     options: FrameworkOptions<U, E>,
     application_id: serenity::ApplicationId,
-    on_message: std::sync::Mutex<
-        Option<
-            Box<
-                dyn Send
-                    + Sync
-                    + for<'a> FnMut(
-                        &'a serenity::Context,
-                        &'a serenity::Message,
-                        &'a Self,
-                    ) -> BoxFuture<'a, Result<U, E>>,
-            >,
-        >,
-    >
+    shard_manager: arc_swap::ArcSwapOption<tokio::sync::Mutex<ShardManager>>,
 }
 
 impl<U, E> Framework<U, E> {
@@ -120,45 +111,44 @@ impl<U, E> Framework<U, E> {
         FrameworkBuilder::default()
     }
 
-    // /// Setup a new [`Framework`]
-    // ///
-    // /// Takes several arguments:
-    // /// - the prefix used for parsing commands from messages
-    // /// - the Discord application ID (required for slash commands)
-    // /// - a callback to create user data
-    // /// - framework configuration via [`FrameworkOptions`]
-    // ///
-    // /// The user data callback is invoked as soon as the bot is logged in. That way, bot data like
-    // /// user ID or connected guilds can be made available to the user data setup function. The user
-    // /// data setup is not allowed to return Result because there would be no reasonable
-    // /// course of action on error.
-    // #[deprecated = "use Framework::build() instead"]
-    // pub fn new<F>(
-    //     prefix: impl Into<String>,
-    //     application_id: serenity::ApplicationId,
-    //     bot_id: serenity::UserId,
-    //     user_data_setup: F,
-    //     options: FrameworkOptions<U, E>,
-    // ) -> Self
-    // where
-    //     F: Send
-    //         + Sync
-    //         + 'static
-    //         + for<'a> FnOnce(
-    //             &'a serenity::Context,
-    //             &'a serenity::Ready,
-    //             &'a Self,
-    //         ) -> BoxFuture<'a, Result<U, E>>,
-    // {
-    //     Self {
-    //         prefix: prefix.into(),
-    //         user_data: once_cell::sync::OnceCell::new(),
-    //         user_data_setup: std::sync::Mutex::new(Some(Box::new(user_data_setup))),
-    //         bot_id,
-    //         options,
-    //         application_id,
-    //     }
-    // }
+    /// Setup a new [`Framework`]
+    ///
+    /// Takes several arguments:
+    /// - the prefix used for parsing commands from messages
+    /// - the Discord application ID (required for slash commands)
+    /// - a callback to create user data
+    /// - framework configuration via [`FrameworkOptions`]
+    ///
+    /// The user data callback is invoked as soon as the bot is logged in. That way, bot data like
+    /// user ID or connected guilds can be made available to the user data setup function. The user
+    /// data setup is not allowed to return Result because there would be no reasonable
+    /// course of action on error.
+    #[deprecated = "use Framework::build() instead"]
+    pub fn new<F>(
+        application_id: serenity::ApplicationId,
+        bot_id: serenity::UserId,
+        user_data_setup: F,
+        options: FrameworkOptions<U, E>,
+    ) -> Self
+    where
+        F: Send
+            + Sync
+            + 'static
+            + for<'a> FnOnce(
+                &'a serenity::Context,
+                &'a serenity::Ready,
+                &'a Self,
+            ) -> BoxFuture<'a, Result<U, E>>,
+    {
+        Self {
+            user_data: once_cell::sync::OnceCell::new(),
+            user_data_setup: std::sync::Mutex::new(Some(Box::new(user_data_setup))),
+            bot_id,
+            options,
+            application_id,
+            shard_manager: arc_swap::ArcSwapOption::from(None),
+        }
+    }
 
     /// Start the framework.
     ///
@@ -176,7 +166,8 @@ impl<U, E> Framework<U, E> {
         let application_id = self.application_id;
 
         let self_1 = std::sync::Arc::new(self);
-        let self_2 = std::sync::Arc::clone(&self_1);
+        let self_2 = self_1.clone();
+        let self_3 = self_1.clone();
 
         let edit_track_cache_purge_task = tokio::spawn(async move {
             loop {
@@ -194,12 +185,17 @@ impl<U, E> Framework<U, E> {
                 self_2.event(ctx, event).await;
             }) as _
         });
-        builder
+
+        let mut client: Client = builder
             .application_id(application_id.0)
             .event_handler(event_handler)
-            .await?
-            .start()
             .await?;
+
+        self_3
+            .shard_manager
+            .store(Some(client.shard_manager.clone()));
+
+        client.start().await?;
 
         edit_track_cache_purge_task.abort();
 
@@ -216,9 +212,9 @@ impl<U, E> Framework<U, E> {
         self.application_id
     }
 
-    /// Returns the main prefix for prefix commands
-    pub fn prefix(&self) -> &str {
-        &self.prefix
+    /// Returns the serenity's client shard manager.
+    pub fn shard_manager(&self) -> std::sync::Arc<tokio::sync::Mutex<ShardManager>> {
+        self.shard_manager.load().as_ref().unwrap().clone()
     }
 
     async fn get_user_data(&self) -> &U {
@@ -265,25 +261,26 @@ impl<U, E> Framework<U, E> {
                         .await;
                     }
                 }
-                let on_message = Option::take(&mut *self.on_message.lock().unwrap());
-                if let Some(mut on_message) = on_message {
-                    if let Err(_) = (on_message)(&ctx, new_message, self).await {
-                        println!("Error occured in on_message");
-                    }
-                }
             }
             Event::MessageUpdate { event, .. } => {
                 if let Some(edit_tracker) = &self.options.prefix_options.edit_tracker {
-                    let msg = edit_tracker.write().process_message_update(event);
+                    let msg = edit_tracker.write().process_message_update(
+                        event,
+                        self.options().prefix_options.ignore_edit_tracker_cache,
+                    );
 
-                    if let Err(Some((err, ctx))) =
-                        prefix::dispatch_message(self, &ctx, &msg, true).await
-                    {
-                        (self.options.on_error)(
-                            err,
-                            crate::ErrorContext::Command(crate::CommandErrorContext::Prefix(ctx)),
-                        )
-                        .await;
+                    if let Some(msg) = msg {
+                        if let Err(Some((err, ctx))) =
+                            prefix::dispatch_message(self, &ctx, &msg, true).await
+                        {
+                            (self.options.on_error)(
+                                err,
+                                crate::ErrorContext::Command(crate::CommandErrorContext::Prefix(
+                                    ctx,
+                                )),
+                            )
+                            .await;
+                        }
                     }
                 }
             }

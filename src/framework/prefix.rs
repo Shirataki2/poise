@@ -1,47 +1,23 @@
 use crate::serenity_prelude as serenity;
 
-// Adapted from serenity::Typing
-#[derive(Debug)]
-struct DelayedTyping(tokio::sync::oneshot::Sender<()>);
-impl DelayedTyping {
-    pub fn start(
-        http: &std::sync::Arc<serenity::Http>,
-        channel_id: serenity::ChannelId,
-        delay: std::time::Duration,
-    ) -> Self {
-        let (sx, mut rx) = tokio::sync::oneshot::channel();
-
-        let http = std::sync::Arc::clone(http);
-        tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            loop {
-                match rx.try_recv() {
-                    Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => break,
-                    _ => (),
-                }
-
-                channel_id.broadcast_typing(&http).await?;
-
-                // It is unclear for how long typing persists after this method is called.
-                // It is generally assumed to be 7 or 10 seconds, so we use 7 to be safe.
-                tokio::time::sleep(std::time::Duration::from_secs(7)).await;
-            }
-
-            Ok::<_, serenity::Error>(())
-        });
-
-        Self(sx)
-    }
-}
-
 // Returns message with (only) bot prefix removed, if it matches
 async fn strip_prefix<'a, U, E>(
     this: &'a super::Framework<U, E>,
     ctx: &'a serenity::Context,
     msg: &'a serenity::Message,
 ) -> Option<&'a str> {
-    if let Some(content) = msg.content.strip_prefix(&this.prefix) {
-        return Some(content);
+    if let Some(dynamic_prefix) = this.options.prefix_options.dynamic_prefix {
+        if let Some(prefix) = dynamic_prefix(ctx, msg, this.get_user_data().await).await {
+            if let Some(content) = msg.content.strip_prefix(&prefix) {
+                return Some(content);
+            }
+        }
+    }
+
+    if let Some(prefix) = &this.options.prefix_options.prefix {
+        if let Some(content) = msg.content.strip_prefix(prefix) {
+            return Some(content);
+        }
     }
 
     if let Some(content) = this
@@ -64,21 +40,22 @@ async fn strip_prefix<'a, U, E>(
         return Some(content);
     }
 
-    if this.options.prefix_options.mention_as_prefix {
-        // Mentions are either <@USER_ID> or <@!USER_ID>
-        if let Some(content) = msg
-            .content
-            .strip_prefix("<@")?
-            .trim_start_matches('!')
-            .strip_prefix(&this.bot_id.0.to_string())?
-            .strip_prefix('>')
-        {
+    if let Some(dynamic_prefix) = this.options.prefix_options.stripped_dynamic_prefix {
+        if let Some(content) = dynamic_prefix(ctx, msg, this.get_user_data().await).await {
             return Some(content);
         }
     }
 
-    if let Some(dynamic_prefix) = this.options.prefix_options.dynamic_prefix {
-        if let Some(content) = dynamic_prefix(ctx, msg, this.get_user_data().await).await {
+    if this.options.prefix_options.mention_as_prefix {
+        // Mentions are either <@USER_ID> or <@!USER_ID>
+        let stripped_mention_prefix = || {
+            msg.content
+                .strip_prefix("<@")?
+                .trim_start_matches('!')
+                .strip_prefix(&this.bot_id.0.to_string())?
+                .strip_prefix('>')
+        };
+        if let Some(content) = stripped_mention_prefix() {
             return Some(content);
         }
     }
@@ -166,12 +143,22 @@ where
             continue;
         }
 
-        // Only continue if command check returns true
-        let command_check = command
-            .options
-            .check
-            .unwrap_or(this.options.prefix_options.command_check);
-        let check_passes = command_check(prefix_ctx).await.map_err(|e| {
+        // Only continue if command checks returns true
+        let checks_passing = (|| async {
+            let global_check_passes = match &this.options.command_check {
+                Some(check) => check(crate::Context::Prefix(prefix_ctx)).await?,
+                None => true,
+            };
+
+            let command_specific_check_passes = match &command.options.check {
+                Some(check) => check(prefix_ctx).await?,
+                None => true,
+            };
+
+            Ok(global_check_passes && command_specific_check_passes)
+        })()
+        .await
+        .map_err(|e| {
             (
                 e,
                 crate::PrefixCommandErrorContext {
@@ -181,7 +168,7 @@ where
                 },
             )
         })?;
-        if !check_passes {
+        if !checks_passing {
             continue;
         }
 
@@ -200,7 +187,9 @@ where
     Ok(first_matching_command)
 }
 
-/// Returns
+/// Manually dispatches a message with the prefix framework.
+///
+/// Returns:
 /// - Ok(()) if a command was successfully dispatched and run
 /// - Err(None) if no command was run but no error happened
 /// - Err(Some(error: UserError)) if any user code yielded an error
@@ -237,19 +226,6 @@ where
     if triggered_by_edit && !command.options.track_edits {
         return Err(None);
     }
-
-    // Typing is broadcasted as long as this object is alive
-    let _typing_broadcaster = match command
-        .options
-        .broadcast_typing
-        .as_ref()
-        .unwrap_or(&this.options.prefix_options.broadcast_typing)
-    {
-        crate::BroadcastTypingBehavior::None => None,
-        crate::BroadcastTypingBehavior::WithDelay(delay) => {
-            Some(DelayedTyping::start(&ctx.http, msg.channel_id, *delay))
-        }
-    };
 
     let ctx = crate::PrefixContext {
         discord: ctx,

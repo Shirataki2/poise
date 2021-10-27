@@ -25,6 +25,60 @@ impl<'a, U, E> From<crate::PrefixContext<'a, U, E>> for Context<'a, U, E> {
         Self::Prefix(x)
     }
 }
+impl<'a, U, E> Context<'a, U, E> {
+    /// Delegates to [`crate::ApplicationContext::defer_response`].
+    ///
+    /// This will make the response public; to make it ephemeral, use [`Self::defer_ephemeral()`].
+    pub async fn defer(self) -> Result<(), serenity::Error> {
+        if let Self::Application(ctx) = self {
+            ctx.defer_response(false).await?;
+        }
+        Ok(())
+    }
+
+    /// Delegates to [`crate::ApplicationContext::defer_response`].
+    ///
+    /// This will make the response ephemeral; to make it public, use [`Self::defer()`].
+    pub async fn defer_ephemeral(self) -> Result<(), serenity::Error> {
+        if let Self::Application(ctx) = self {
+            ctx.defer_response(true).await?;
+        }
+        Ok(())
+    }
+
+    /// If this is an application command, it delegates to [`crate::ApplicationContext::defer_response`].
+    ///
+    /// If this is a prefix command, a typing broadcast is started until the return value is
+    /// dropped.
+    #[must_use = "The typing broadcast will only persist if you store it"]
+    pub async fn defer_or_broadcast(self) -> Result<Option<serenity::Typing>, serenity::Error> {
+        Ok(match self {
+            Self::Application(ctx) => {
+                ctx.defer_response(false).await?;
+                None
+            }
+            Self::Prefix(ctx) => Some(ctx.msg.channel_id.start_typing(&ctx.discord.http)?),
+        })
+    }
+
+    /// Shorthand of [`crate::say_reply`]
+    pub async fn say(
+        self,
+        text: impl Into<String>,
+    ) -> Result<crate::ReplyHandle<'a>, serenity::Error> {
+        crate::say_reply(self, text).await
+    }
+
+    /// Shorthand of [`crate::send_reply`]
+    pub async fn send(
+        self,
+        builder: impl for<'b, 'c> FnOnce(
+            &'b mut crate::CreateReply<'c>,
+        ) -> &'b mut crate::CreateReply<'c>,
+    ) -> Result<crate::ReplyHandle<'a>, serenity::Error> {
+        crate::send_reply(self, builder).await
+    }
+}
 
 // needed for proc macro
 #[doc(hidden)]
@@ -122,6 +176,14 @@ impl<U, E> Context<'_, U, E> {
                 id
             }
         }
+    }
+
+    /// Returns a reference to the command.
+    pub fn command(&self) -> Option<crate::CommandRef<'_, U, E>> {
+        Some(match self {
+            Self::Prefix(x) => crate::CommandRef::Prefix(x.command?),
+            Self::Application(x) => crate::CommandRef::Application(x.command),
+        })
     }
 }
 
@@ -310,6 +372,11 @@ pub struct FrameworkOptions<U, E> {
     pub on_error: fn(E, ErrorContext<'_, U, E>) -> BoxFuture<'_, ()>,
     /// Called before every command
     pub pre_command: fn(Context<'_, U, E>) -> BoxFuture<'_, ()>,
+    /// Provide a callback to be invoked before every command. The command will only be executed
+    /// if the callback returns true.
+    ///
+    /// If individual commands add their own check, both callbacks are run and must return true.
+    pub command_check: Option<fn(Context<'_, U, E>) -> BoxFuture<'_, Result<bool, E>>>,
     /// Default set of allowed mentions to use for all responses
     pub allowed_mentions: Option<serenity::CreateAllowedMentions>,
     /// Called on every Discord event. Can be used to react to non-command events, like messages
@@ -427,6 +494,7 @@ impl<U: Send + Sync, E: std::fmt::Display + Send> Default for FrameworkOptions<U
             },
             listener: |_, _, _, _| Box::pin(async { Ok(()) }),
             pre_command: |_| Box::pin(async {}),
+            command_check: None,
             allowed_mentions: Some({
                 let mut f = serenity::CreateAllowedMentions::default();
                 // Only support direct user pings by default

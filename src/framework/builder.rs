@@ -12,7 +12,6 @@ use crate::BoxFuture;
 /// Before starting, the builder will make an HTTP request to retrieve the bot's application ID and
 /// owner.
 pub struct FrameworkBuilder<U, E> {
-    prefix: Option<String>,
     user_data_setup: Option<
         Box<
             dyn Send
@@ -33,39 +32,26 @@ pub struct FrameworkBuilder<U, E> {
         crate::CommandDefinition<U, E>,
         Box<dyn FnOnce(&mut crate::CommandBuilder<U, E>) -> &mut crate::CommandBuilder<U, E>>,
     )>,
-    on_message: Option<
-        Box<
-            dyn Send
-                + Sync
-                + for<'a> FnMut(
-                    &'a serenity::Context,
-                    &'a serenity::Message,
-                    &'a crate::Framework<U, E>,
-                ) -> BoxFuture<'a, Result<U, E>>,
-        >,
-    >,
 }
 
 impl<U, E> Default for FrameworkBuilder<U, E> {
     fn default() -> Self {
         Self {
-            prefix: Default::default(),
             user_data_setup: Default::default(),
             options: Default::default(),
             client_settings: Default::default(),
             token: Default::default(),
             intents: Default::default(),
             commands: Default::default(),
-            on_message: Default::default(),
         }
     }
 }
 
 impl<U, E> FrameworkBuilder<U, E> {
     /// Set a prefix for commands
-    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.prefix = Some(prefix.into());
-        self
+    #[deprecated = "Please set the prefix via FrameworkOptions::prefix_options::prefix"]
+    pub fn prefix(self, _prefix: impl Into<String>) -> Self {
+        panic!("Please set the prefix via FrameworkOptions::prefix_options::prefix");
     }
 
     /// Set a callback to be invoked to create the user data instance
@@ -84,32 +70,17 @@ impl<U, E> FrameworkBuilder<U, E> {
         self
     }
 
-    /// Set message callback
-    pub fn on_message<F>(mut self, on_message: F) -> Self
-    where
-        F: Send
-            + Sync
-            + 'static
-            + for<'a> FnMut(
-                &'a serenity::Context,
-                &'a serenity::Message,
-                &'a crate::Framework<U, E>,
-            ) -> BoxFuture<'a,  Result<U, E>>,
-    {
-        self.on_message = Some(Box::new(on_message));
-        self
-    }
-
     /// Configure framework options
     pub fn options(mut self, options: crate::FrameworkOptions<U, E>) -> Self {
         self.options = Some(options);
         self
     }
 
-    /// Configure in-detail serenity client settings by supplying a custom client builder
+    /// Configure serenity client settings, like gateway intents, by supplying a custom
+    /// client builder
     ///
-    /// Note: the builder's token and gateway intents will be overridden by the
-    /// [`FrameworkBuilder`]. Please use [`FrameworkBuilder`]'s respective methods instead.
+    /// Note: the builder's token will be overridden by the
+    /// [`FrameworkBuilder`]; use [`FrameworkBuilder::token`] to supply a token.
     pub fn client_settings(
         mut self,
         f: impl FnOnce(serenity::ClientBuilder<'_>) -> serenity::ClientBuilder<'_> + 'static,
@@ -121,12 +92,6 @@ impl<U, E> FrameworkBuilder<U, E> {
     /// The bot token
     pub fn token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
-        self
-    }
-
-    /// Configure gateway intents, which control the types of Discord events your bot will receive
-    pub fn intents(mut self, intents: serenity::GatewayIntents) -> Self {
-        self.intents = Some(intents);
         self
     }
 
@@ -151,13 +116,9 @@ impl<U, E> FrameworkBuilder<U, E> {
     {
         // Aggregate required values or panic if not provided
         let token = self.token.expect("No token was provided to the framework");
-        let prefix = self
-            .prefix
-            .expect("No prefix was provided to the framework");
         let user_data_setup = self
             .user_data_setup
             .expect("No user data setup function was provided to the framework");
-        let on_message = self.on_message.unwrap();
         let mut options = self.options.expect("No framework options provided");
 
         // Retrieve application info via HTTP
@@ -173,7 +134,6 @@ impl<U, E> FrameworkBuilder<U, E> {
 
         // Create framework with specified settings
         let framework = crate::Framework {
-            prefix,
             user_data: once_cell::sync::OnceCell::new(),
             user_data_setup: std::sync::Mutex::new(Some(user_data_setup)),
             bot_id: serenity::parse_token(&token)
@@ -181,7 +141,7 @@ impl<U, E> FrameworkBuilder<U, E> {
                 .bot_user_id,
             options,
             application_id: serenity::ApplicationId(application_info.id.0),
-            on_message: std::sync::Mutex::new(Some(on_message)),
+            shard_manager: arc_swap::ArcSwapOption::from(None),
         };
 
         // Create serenity client

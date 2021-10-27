@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - develop
 
 jobs:
   docs:
@@ -27,11 +28,19 @@ jobs:
         run: |
           cargo doc --no-deps --all-features
 
+      - name: Move files
+        shell: bash
+        run: |
+          DIR=${GITHUB_REF#refs/heads/}
+          mkdir -p ./docs/$DIR
+          mv ./target/doc/* ./docs/$DIR/
+
+
       - name: Deploy docs
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_branch: gh-pages
-          publish_dir: ./target/doc
+          publish_dir: ./docs
           allow_empty_commit: false
           keep_files: true

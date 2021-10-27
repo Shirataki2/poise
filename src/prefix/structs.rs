@@ -52,8 +52,6 @@ pub struct PrefixCommandOptions<U, E> {
     ///
     /// Note: this won't do anything if `Framework::edit_tracker` isn't set.
     pub track_edits: bool,
-    /// Falls back to the framework-specified value on None. See there for documentation.
-    pub broadcast_typing: Option<BroadcastTypingBehavior>,
     /// Whether to hide this command in help menus.
     pub hide_in_help: bool,
     /// Permissions which users must have to invoke this command.
@@ -74,7 +72,6 @@ impl<U, E> Default for PrefixCommandOptions<U, E> {
             on_error: None,
             aliases: &[],
             track_edits: false,
-            broadcast_typing: None,
             hide_in_help: false,
             required_permissions: serenity::Permissions::empty(),
             owners_only: false,
@@ -133,12 +130,29 @@ pub enum Prefix {
 
 /// Prefix-specific framework configuration
 pub struct PrefixFrameworkOptions<U, E> {
+    /// The main bot prefix. Can be set to None if the bot supports only
+    /// [dynamic prefixes](Self::dynamic_prefix).
+    pub prefix: Option<String>,
     /// List of bot commands.
     pub commands: Vec<PrefixCommandMeta<U, E>>,
     /// List of additional bot prefixes
     // TODO: maybe it would be nicer to have separate fields for literal and regex prefixes
     // That way, you don't need to wrap every single literal prefix in a long path which looks ugly
     pub additional_prefixes: Vec<Prefix>,
+    /// Callback invoked on evevry message to return a prefix.
+    ///
+    /// If Some is returned, the static prefix, along with the additional prefixes will be ignored,
+    /// and the returned prefix will be used for checking, but if None is returned, the static
+    /// prefix and additional prefixes will be checked instead.
+    ///
+    /// Override this field for a simple dynamic prefixe which changes depending on the guild or user.
+    pub dynamic_prefix: Option<
+        for<'a> fn(
+            &'a serenity::Context,
+            &'a serenity::Message,
+            &'a U,
+        ) -> BoxFuture<'a, Option<String>>,
+    >,
     /// Callback invoked on every message to strip the prefix off an incoming message.
     ///
     /// Override this field for dynamic prefixes which change depending on guild or user.
@@ -147,7 +161,7 @@ pub struct PrefixFrameworkOptions<U, E> {
     /// ```rust,ignore
     /// msg.content.strip_prefix(my_cool_prefix)
     /// ```
-    pub dynamic_prefix: Option<
+    pub stripped_dynamic_prefix: Option<
         for<'a> fn(
             &'a serenity::Context,
             &'a serenity::Message,
@@ -156,16 +170,14 @@ pub struct PrefixFrameworkOptions<U, E> {
     >,
     /// Treat a bot mention (a ping) like a prefix
     pub mention_as_prefix: bool,
-    /// Provide a callback to be invoked before every command. The command will only be executed
-    /// if the callback returns true.
-    ///
-    /// Individual commands may override this callback.
-    pub command_check: fn(PrefixContext<'_, U, E>) -> BoxFuture<'_, Result<bool, E>>,
     /// If Some, the framework will react to message edits by editing the corresponding bot response
     /// with the new result.
     pub edit_tracker: Option<parking_lot::RwLock<super::EditTracker>>,
-    /// Whether to broadcast a typing indicator while executing this commmand's action.
-    pub broadcast_typing: BroadcastTypingBehavior,
+    /// Wether or not to ignore message edits on messages outside the cache.
+    /// This can happen if the message edit happens while the command is being invoked, or the
+    /// original message wasn't a command.
+    pub ignore_edit_tracker_cache: bool,
+
     /// Whether commands in messages emitted by the bot itself should be executed as well.
     pub execute_self_messages: bool,
     /// Whether command names should be compared case-insensitively.
@@ -184,13 +196,14 @@ pub struct PrefixFrameworkOptions<U, E> {
 impl<U, E> Default for PrefixFrameworkOptions<U, E> {
     fn default() -> Self {
         Self {
+            prefix: None,
             commands: Vec::new(),
             additional_prefixes: Vec::new(),
             dynamic_prefix: None,
+            stripped_dynamic_prefix: None,
             mention_as_prefix: true,
-            command_check: |_| Box::pin(async { Ok(true) }),
             edit_tracker: None,
-            broadcast_typing: BroadcastTypingBehavior::None,
+            ignore_edit_tracker_cache: false,
             execute_self_messages: false,
             case_insensitive_commands: true,
             // help_when_mentioned: true,
@@ -198,15 +211,4 @@ impl<U, E> Default for PrefixFrameworkOptions<U, E> {
             // command_specific_help_commmand: None,
         }
     }
-}
-
-/// Defines whether and in what way commands send a typing notification
-pub enum BroadcastTypingBehavior {
-    /// Don't broadcast typing
-    None,
-    // TODO: make Immediate variant maybe?
-    /// Broadcast typing after the command has been running for a certain time
-    ///
-    /// Set duration to zero for immediate typing broadcast
-    WithDelay(std::time::Duration),
 }

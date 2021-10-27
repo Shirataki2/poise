@@ -142,12 +142,22 @@ pub async fn dispatch_interaction<'a, U, E>(
         return Ok(());
     }
 
-    // Only continue if command check returns true
-    let command_check = command
-        .options()
-        .check
-        .unwrap_or(this.options.application_options.command_check);
-    let check_passes = command_check(ctx).await.map_err(|e| {
+    // Only continue if command checks returns true
+    let checks_passing = (|| async {
+        let global_check_passes = match &this.options.command_check {
+            Some(check) => check(crate::Context::Application(ctx)).await?,
+            None => true,
+        };
+
+        let command_specific_check_passes = match &command.options().check {
+            Some(check) => check(ctx).await?,
+            None => true,
+        };
+
+        Ok(global_check_passes && command_specific_check_passes)
+    })()
+    .await
+    .map_err(|e| {
         (
             e,
             crate::ApplicationCommandErrorContext {
@@ -157,18 +167,8 @@ pub async fn dispatch_interaction<'a, U, E>(
             },
         )
     })?;
-    if !check_passes {
+    if !checks_passing {
         return Ok(());
-    }
-
-    if command
-        .options()
-        .defer_response
-        .unwrap_or(this.options.application_options.defer_response)
-    {
-        if let Err(e) = ctx.defer_response().await {
-            println!("Failed to send interaction acknowledgement: {}", e);
-        }
     }
 
     (this.options.pre_command)(crate::Context::Application(ctx)).await;

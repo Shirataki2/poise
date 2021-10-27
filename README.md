@@ -1,7 +1,7 @@
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)](https://kangalioo.github.io/poise/poise/)
 [![Docs](https://img.shields.io/badge/docs-online-informational)](https://kangalioo.github.io/poise/poise/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust: 1.48+](https://img.shields.io/badge/rust-1.48+-93450a)](https://blog.rust-lang.org/2020/11/19/Rust-1.48.html)
+[![Rust: 1.51+](https://img.shields.io/badge/rust-1.51+-93450a)](https://blog.rust-lang.org/2020/11/19/Rust-1.51.html)
 
 # Poise
 Poise is an opinionated Discord bot framework with a few distinctive features:
@@ -30,10 +30,7 @@ pub async fn age(
     #[description = "Selected user"] user: Option<serenity::User>,
 ) -> Result<(), Error> {
     let user = user.as_ref().unwrap_or(ctx.author());
-    poise::say_reply(
-        ctx,
-        format!("{}'s account was created at {}", user.name, user.created_at()),
-    ).await?;
+    ctx.say(format!("{}'s account was created at {}", user.name, user.created_at())).await?;
     
     Ok(())
 }
@@ -43,7 +40,7 @@ async fn main() {
     poise::Framework::build()
         .prefix("~")
         .token(std::env::var("DISCORD_BOT_TOKEN").unwrap())
-        .user_data_setup(move |_ctx, _ready, _framework| Box::pin(async move { Ok(()) }),
+        .user_data_setup(move |_ctx, _ready, _framework| Box::pin(async move { Ok(()) })),
         .options(poise::FrameworkOptions {
             // configure framework here
             ..Default::default()
@@ -93,8 +90,6 @@ There are several things to note here:
     - `context_menu_command`: Generate a context menu command
     - `aliases`: Command name aliases (only applies to prefix commands)
     - `track_edits`: Enable edit tracking (only applies to prefix commands)
-    - `broadcast_typing`: Trigger a typing indicator while command runs (only applies to prefix commands I think)
-    - `defer_response`: Immediately acknowledge incoming slash command invocation which shows a loading state to the user and gives the bot several minutes to respond
     - `explanation_fn`: Path to a string-returning function which is used for the detailed explanations instead of documentation comments
         - Useful if you have many commands with very similar help messages: you can abstract the common parts into a function
     - `check`: Path to a function which is invoked for every invocation. If the function returns false, the command is not executed
@@ -143,10 +138,9 @@ async fn my_huge_ass_command(
 }
 
 fn my_huge_ass_command_help() -> String {
-    String::from("
+    String::from("\
 Example usage:
-~my_huge_ass_command 127.0.0.1 @kangalioo `i = i + 1` my_flag rest of the message
-    ".trim())
+~my_huge_ass_command 127.0.0.1 @kangalioo `i = i + 1` my_flag rest of the message")
 }
 
 async fn check(ctx: Context<'_>) -> Result<bool, Error> {
