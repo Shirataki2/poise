@@ -18,7 +18,7 @@ async-trait = "0.1.48" # PopArgumentAsync trait
 regex = "1.5.4" # prefix
 arc-swap = "1" # shard manager
 
-songbird = { path = "../songbird" }
+songbird = { git = "https://github.com/Shirataki2/songbird.git" }
 
 [dependencies.serenity]
 default-features = false
@@ -39,4 +39,6 @@ branch = "next"
 tokio = { version = "1.4.0", features = ["rt-multi-thread"] }
 
 [features]
+default = ["collector"]
+
 collector = ["serenity/collector"]
