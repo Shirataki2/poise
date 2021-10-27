@@ -18,8 +18,6 @@ async-trait = "0.1.48" # PopArgumentAsync trait
 regex = "1.5.4" # prefix
 arc-swap = "1" # shard manager
 
-songbird = { git = "https://github.com/Shirataki2/songbird.git" }
-
 [dependencies.serenity]
 default-features = false
 features = ["builder", "cache", "client", "gateway", "model", "utils", "rustls_backend", "unstable_discord_api", "voice"]
@@ -33,6 +31,10 @@ branch = "next"
 # branch = "poise-tailored"
 
 # path = "../_downloaded/serenity"
+
+[dependencies.songbird]
+git = "https://github.com/Shirataki2/songbird.git"
+
 
 [dev-dependencies]
 # For the examples
