@@ -154,7 +154,7 @@ impl<U, E> Framework<U, E> {
     ///
     /// Takes a `serenity::ClientBuilder`, in which you need to supply the bot token, as well as
     /// any gateway intents.
-    pub async fn start(self, builder: serenity::ClientBuilder<'_>) -> Result<(), serenity::Error>
+    pub async fn start(self, builder: serenity::ClientBuilder) -> Result<(), serenity::Error>
     where
         U: Send + Sync + 'static,
         E: 'static + Send,
