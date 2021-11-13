@@ -83,7 +83,7 @@ impl<U, E> FrameworkBuilder<U, E> {
     /// [`FrameworkBuilder`]; use [`FrameworkBuilder::token`] to supply a token.
     pub fn client_settings(
         mut self,
-        f: impl FnOnce(serenity::ClientBuilder<'_>) -> serenity::ClientBuilder<'_> + 'static,
+        f: impl FnOnce(serenity::ClientBuilder) -> serenity::ClientBuilder + 'static,
     ) -> Self {
         self.client_settings = Some(Box::new(f));
         self
