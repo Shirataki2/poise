@@ -25,7 +25,7 @@ pub struct FrameworkBuilder<U, E> {
     >,
     options: Option<crate::FrameworkOptions<U, E>>,
     client_settings:
-        Option<Box<dyn FnOnce(serenity::ClientBuilder<'_>) -> serenity::ClientBuilder<'_>>>,
+        Option<Box<dyn FnOnce(serenity::ClientBuilder) -> serenity::ClientBuilder>>,
     token: Option<String>,
     intents: Option<serenity::GatewayIntents>,
     commands: Vec<(
