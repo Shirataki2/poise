@@ -25,12 +25,22 @@ pub use framework::*;
 mod reply;
 pub use reply::*;
 
-pub mod samples;
+mod cooldown;
+pub use cooldown::*;
+
+pub(crate) mod util;
+
+pub mod builtins;
+/// See [`builtins`]
+#[deprecated = "`samples` module was renamed to `builtins`"]
+pub mod samples {
+    pub use crate::builtins::*;
+}
 
 #[doc(no_inline)]
 pub use async_trait::async_trait;
+pub use futures;
 pub use poise_macros::*;
-pub use serde_json;
 pub use serenity;
 
 /// This module re-exports a bunch of items from all over serenity. Useful if you can't
@@ -52,7 +62,7 @@ pub mod serenity_prelude {
         http::*,
         model::{
             event::*,
-            interactions::{application_command::*, message_component::*, *},
+            interactions::{application_command::*, autocomplete::*, message_component::*, *},
             prelude::*,
         },
         prelude::*,

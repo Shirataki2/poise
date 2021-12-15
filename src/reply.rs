@@ -76,7 +76,7 @@ impl<'a> CreateReply<'a> {
 /// requires a network request.
 pub enum ReplyHandle<'a> {
     /// When sending a normal message, Discord returns the message object directly
-    Prefix(serenity::Message),
+    Prefix(Box<serenity::Message>),
     /// When sending an application command response, you need to request the message object
     /// seperately
     Application {
@@ -95,7 +95,7 @@ impl ReplyHandle<'_> {
     /// Only needs to do an HTTP request in the application command response case
     pub async fn message(self) -> Result<serenity::Message, serenity::Error> {
         match self {
-            Self::Prefix(msg) => Ok(msg),
+            Self::Prefix(msg) => Ok(*msg),
             Self::Application { http, interaction } => {
                 interaction.get_interaction_response(http).await
             }
@@ -121,19 +121,27 @@ impl ReplyHandle<'_> {
 /// ).await?;
 /// # Ok(()) }
 /// ```
-pub async fn send_reply<U, E>(
+pub async fn send_reply<'a, U, E>(
     ctx: crate::Context<'_, U, E>,
-    builder: impl for<'a, 'b> FnOnce(&'a mut CreateReply<'b>) -> &'a mut CreateReply<'b>,
-) -> Result<ReplyHandle<'_>, serenity::Error> {
+    builder: impl for<'b> FnOnce(&'b mut CreateReply<'a>) -> &'b mut CreateReply<'a>,
+) -> Result<Option<ReplyHandle<'_>>, serenity::Error> {
     Ok(match ctx {
-        crate::Context::Prefix(ctx) => {
-            ReplyHandle::Prefix(crate::send_prefix_reply(ctx, builder).await?)
-        }
+        crate::Context::Prefix(ctx) => Some(ReplyHandle::Prefix(
+            crate::send_prefix_reply(ctx, builder).await?,
+        )),
         crate::Context::Application(ctx) => {
             crate::send_application_reply(ctx, builder).await?;
-            ReplyHandle::Application {
-                interaction: ctx.interaction,
-                http: &ctx.discord.http,
+
+            if let crate::ApplicationCommandOrAutocompleteInteraction::ApplicationCommand(
+                interaction,
+            ) = &ctx.interaction
+            {
+                Some(ReplyHandle::Application {
+                    interaction,
+                    http: &ctx.discord.http,
+                })
+            } else {
+                None
             }
         }
     })
@@ -143,6 +151,6 @@ pub async fn send_reply<U, E>(
 pub async fn say_reply<U, E>(
     ctx: crate::Context<'_, U, E>,
     text: impl Into<String>,
-) -> Result<ReplyHandle<'_>, serenity::Error> {
+) -> Result<Option<ReplyHandle<'_>>, serenity::Error> {
     send_reply(ctx, |m| m.content(text.into())).await
 }

@@ -59,44 +59,45 @@ impl EditTracker {
     /// Note: [`EditTracker`] will only purge messages outside the duration when [`Self::purge`]
     /// is called. If you supply the created [`EditTracker`] to [`crate::Framework`], the framework
     /// will take care of that by calling [`Self::purge`] periodically.
-    pub fn for_timespan(duration: std::time::Duration) -> parking_lot::RwLock<Self> {
-        parking_lot::RwLock::new(Self {
+    pub fn for_timespan(duration: std::time::Duration) -> std::sync::RwLock<Self> {
+        std::sync::RwLock::new(Self {
             max_duration: duration,
             cache: Vec::new(),
         })
     }
 
     /// Returns a copy of a newly up-to-date cached message, or a brand new generated message when
-    /// not in cache
+    /// not in cache. Also returns a bool with `true` if this message was previously tracked
     ///
-    /// Returns None if the command shouldn't be re-run, e.g. if the message content stayed the
-    /// same
+    /// Returns None if the command shouldn't be re-run, e.g. if the message content wasn't edited
     pub fn process_message_update(
         &mut self,
         user_msg_update: &serenity::MessageUpdateEvent,
         ignore_edit_tracker_cache: bool,
-    ) -> Option<serenity::Message> {
+    ) -> Option<(serenity::Message, bool)> {
         match self
             .cache
             .iter_mut()
             .find(|(user_msg, _)| user_msg.id == user_msg_update.id)
         {
             Some((user_msg, _)) => {
-                // If message content didn't change, don't re-run command
-                match &user_msg_update.content {
-                    Some(content) if content == &user_msg.content => return None,
-                    None => return None,
-                    _ => {}
+                // If message content wasn't touched, don't re-run command
+                // Note: this may be Some, but still identical to previous content. We want to
+                // re-run the command in that case too; because that means the user explicitly
+                // edited their message
+                #[allow(clippy::question_mark)]
+                if user_msg_update.content.is_none() {
+                    return None;
                 }
 
                 update_message(user_msg, user_msg_update.clone());
-                Some(user_msg.clone())
+                Some((user_msg.clone(), true))
             }
             None => {
                 if !ignore_edit_tracker_cache {
                     let mut user_msg = serenity::CustomMessage::new().build();
                     update_message(&mut user_msg, user_msg_update.clone());
-                    Some(user_msg)
+                    Some((user_msg, false))
                 } else {
                     None
                 }
@@ -137,10 +138,10 @@ impl EditTracker {
 }
 
 /// Prefix-specific reply function. For more details, see [`crate::send_reply`].
-pub async fn send_prefix_reply<U, E>(
+pub async fn send_prefix_reply<'a, U, E>(
     ctx: crate::prefix::PrefixContext<'_, U, E>,
-    builder: impl for<'a, 'b> FnOnce(&'a mut crate::CreateReply<'b>) -> &'a mut crate::CreateReply<'b>,
-) -> Result<serenity::Message, serenity::Error> {
+    builder: impl for<'b> FnOnce(&'b mut crate::CreateReply<'a>) -> &'b mut crate::CreateReply<'a>,
+) -> Result<Box<serenity::Message>, serenity::Error> {
     let mut reply = crate::CreateReply::default();
     builder(&mut reply);
     let crate::CreateReply {
@@ -153,7 +154,13 @@ pub async fn send_prefix_reply<U, E>(
 
     let lock_edit_tracker = || {
         if let Some(command) = ctx.command {
-            if !command.options.track_edits {
+            // If we definitely don't need to track this command invocation, stop
+            let execute_untracked_edits = ctx
+                .framework
+                .options()
+                .prefix_options
+                .execute_untracked_edits;
+            if !(command.track_edits || execute_untracked_edits) {
                 return None;
             }
         }
@@ -163,7 +170,7 @@ pub async fn send_prefix_reply<U, E>(
             .prefix_options
             .edit_tracker
             .as_ref()
-            .map(|t| t.write())
+            .map(|t| t.write().unwrap())
     };
 
     let existing_response = lock_edit_tracker()
@@ -171,7 +178,7 @@ pub async fn send_prefix_reply<U, E>(
         .and_then(|t| t.find_bot_response(ctx.msg.id))
         .cloned();
 
-    Ok(if let Some(mut response) = existing_response {
+    Ok(Box::new(if let Some(mut response) = existing_response {
         response
             .edit(ctx.discord, |f| {
                 // Empty string resets content (happens when user replaces text with embed)
@@ -182,7 +189,7 @@ pub async fn send_prefix_reply<U, E>(
                     None => f.set_embeds(Vec::new()),
                 };
 
-                f.0.insert("attachments", serde_json::json! { [] }); // reset attachments
+                f.0.insert("attachments", serenity::json::json! { [] }); // reset attachments
                 for attachment in attachments {
                     f.attachment(attachment);
                 }
@@ -243,5 +250,5 @@ pub async fn send_prefix_reply<U, E>(
         }
 
         new_response
-    })
+    }))
 }

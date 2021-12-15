@@ -10,6 +10,8 @@ pub struct PrefixContext<'a, U, E> {
     pub discord: &'a serenity::Context,
     /// The invoking user message
     pub msg: &'a serenity::Message,
+    /// Prefix used by the user to invoke this command
+    pub prefix: &'a str,
     /// Read-only reference to the framework
     ///
     /// Useful if you need the list of commands, for example for a custom help command
@@ -34,76 +36,39 @@ impl<U, E> crate::_GetGenerics for PrefixContext<'_, U, E> {
     type E = E;
 }
 
-/// Optional settings for a [`PrefixCommand`].
-pub struct PrefixCommandOptions<U, E> {
-    /// Short description of the command. Displayed inline in help menus and similar.
-    pub inline_help: Option<&'static str>,
-    /// Multiline description with detailed usage instructions. Displayed in the command specific
-    /// help: `~help command_name`
-    // TODO: fix the inconsistency that this is String and everywhere else it's &'static str
-    pub multiline_help: Option<fn() -> String>,
-    /// Alternative triggers for the command
-    pub aliases: &'static [&'static str],
-    /// Falls back to the framework-specified value on None. See there for documentation.
-    pub on_error: Option<fn(E, PrefixCommandErrorContext<'_, U, E>) -> BoxFuture<'_, ()>>,
-    /// If this function returns false, this command will not be executed.
-    pub check: Option<fn(PrefixContext<'_, U, E>) -> BoxFuture<'_, Result<bool, E>>>,
-    /// Whether to enable edit tracking for commands by default.
-    ///
-    /// Note: this won't do anything if `Framework::edit_tracker` isn't set.
-    pub track_edits: bool,
-    /// Whether to hide this command in help menus.
-    pub hide_in_help: bool,
-    /// Permissions which users must have to invoke this command.
-    ///
-    /// Set to [`serenity::Permissions::empty()`] by default
-    pub required_permissions: serenity::Permissions,
-    /// If true, only users from the [owners list](crate::FrameworkOptions::owners) may use this
-    /// command.
-    pub owners_only: bool,
-}
-
-impl<U, E> Default for PrefixCommandOptions<U, E> {
-    fn default() -> Self {
-        Self {
-            inline_help: None,
-            multiline_help: None,
-            check: None,
-            on_error: None,
-            aliases: &[],
-            track_edits: false,
-            hide_in_help: false,
-            required_permissions: serenity::Permissions::empty(),
-            owners_only: false,
-        }
-    }
-}
-
 /// Definition of a single command, excluding metadata which doesn't affect the command itself such
 /// as category.
+#[derive(Clone)]
 pub struct PrefixCommand<U, E> {
-    /// Main name of the command. Aliases can be set in [`PrefixCommandOptions::aliases`].
+    /// Main name of the command. Aliases can be set in [`Self::aliases`].
     pub name: &'static str,
     /// Callback to execute when this command is invoked.
     pub action: for<'a> fn(PrefixContext<'a, U, E>, args: &'a str) -> BoxFuture<'a, Result<(), E>>,
-    /// Optional data to change this command's behavior.
-    pub options: PrefixCommandOptions<U, E>,
+    /// The command ID, shared across all command types that belong to the same implementation
+    pub id: std::sync::Arc<crate::CommandId<U, E>>,
+    /// Alternative triggers for the command
+    pub aliases: &'static [&'static str],
+    /// Whether to enable edit tracking for commands by default.
+    ///
+    /// Note: only has an effect if `Framework::edit_tracker` is set.
+    pub track_edits: bool,
+    /// Whether to broadcast a typing indicator while executing this commmand.
+    pub broadcast_typing: bool,
 }
 
 /// Includes a command, plus metadata like associated sub-commands or category.
+#[derive(Clone)]
 pub struct PrefixCommandMeta<U, E> {
     /// Core command data
     pub command: PrefixCommand<U, E>,
-    /// Identifier for the category that this command will be displayed in for help commands.
-    pub category: Option<&'static str>,
     /// Possible subcommands
     pub subcommands: Vec<PrefixCommandMeta<U, E>>,
 }
 
 /// Context passed alongside the error value to error handlers
 pub struct PrefixCommandErrorContext<'a, U, E> {
-    /// Whether the error occured in a [`check`](PrefixCommandOptions::check) callback
-    pub while_checking: bool,
+    /// What part of the command triggered the error
+    pub location: crate::CommandErrorLocation,
     /// Which command was being processed when the error occured
     pub command: &'a PrefixCommand<U, E>,
     /// Further context
@@ -113,7 +78,7 @@ pub struct PrefixCommandErrorContext<'a, U, E> {
 impl<U, E> Clone for PrefixCommandErrorContext<'_, U, E> {
     fn clone(&self) -> Self {
         Self {
-            while_checking: self.while_checking,
+            location: self.location,
             command: self.command,
             ctx: self.ctx,
         }
@@ -121,6 +86,7 @@ impl<U, E> Clone for PrefixCommandErrorContext<'_, U, E> {
 }
 
 /// Possible ways to define a command prefix
+#[derive(Clone, Debug)]
 pub enum Prefix {
     /// A case-sensitive string literal prefix (passed to [`str::strip_prefix`])
     Literal(&'static str),
@@ -139,40 +105,46 @@ pub struct PrefixFrameworkOptions<U, E> {
     // TODO: maybe it would be nicer to have separate fields for literal and regex prefixes
     // That way, you don't need to wrap every single literal prefix in a long path which looks ugly
     pub additional_prefixes: Vec<Prefix>,
-    /// Callback invoked on evevry message to return a prefix.
+    /// Callback invoked on every message to return a prefix.
     ///
     /// If Some is returned, the static prefix, along with the additional prefixes will be ignored,
     /// and the returned prefix will be used for checking, but if None is returned, the static
     /// prefix and additional prefixes will be checked instead.
     ///
     /// Override this field for a simple dynamic prefixe which changes depending on the guild or user.
-    pub dynamic_prefix: Option<
-        for<'a> fn(
-            &'a serenity::Context,
-            &'a serenity::Message,
-            &'a U,
-        ) -> BoxFuture<'a, Option<String>>,
-    >,
+    pub dynamic_prefix:
+        Option<fn(crate::PartialContext<'_, U, E>) -> BoxFuture<'_, Option<String>>>,
     /// Callback invoked on every message to strip the prefix off an incoming message.
     ///
     /// Override this field for dynamic prefixes which change depending on guild or user.
     ///
-    /// As return value, use the message content with the prefix stripped:
+    /// Return value is a tuple of the prefix and the rest of the message:
     /// ```rust,ignore
-    /// msg.content.strip_prefix(my_cool_prefix)
+    /// if msg.content.starts_with(my_cool_prefix) {
+    ///     return Some(msg.content.split_at(my_cool_prefix.len()));
+    /// }
     /// ```
     pub stripped_dynamic_prefix: Option<
         for<'a> fn(
             &'a serenity::Context,
             &'a serenity::Message,
             &'a U,
-        ) -> BoxFuture<'a, Option<&'a str>>,
+        ) -> BoxFuture<'a, Option<(&'a str, &'a str)>>,
     >,
     /// Treat a bot mention (a ping) like a prefix
     pub mention_as_prefix: bool,
     /// If Some, the framework will react to message edits by editing the corresponding bot response
     /// with the new result.
-    pub edit_tracker: Option<parking_lot::RwLock<super::EditTracker>>,
+    pub edit_tracker: Option<std::sync::RwLock<super::EditTracker>>,
+    /// If the user makes a typo in their message and a subsequent edit creates a valid invocation,
+    /// the bot will execute the command if this attribute is set. [`Self::edit_tracker`] does not
+    /// need to be set for this.
+    ///
+    /// That does not mean that any subsequent edits will also trigger execution. For that,
+    /// see [`PrefixCommand::track_edits`].
+    ///
+    /// Note: only has an effect if [`Self::edit_tracker`] is set.
+    pub execute_untracked_edits: bool,
     /// Wether or not to ignore message edits on messages outside the cache.
     /// This can happen if the message edit happens while the command is being invoked, or the
     /// original message wasn't a command.
@@ -203,6 +175,7 @@ impl<U, E> Default for PrefixFrameworkOptions<U, E> {
             stripped_dynamic_prefix: None,
             mention_as_prefix: true,
             edit_tracker: None,
+            execute_untracked_edits: true,
             ignore_edit_tracker_cache: false,
             execute_self_messages: false,
             case_insensitive_commands: true,

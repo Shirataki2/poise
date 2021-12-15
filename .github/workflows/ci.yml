@@ -1,10 +1,10 @@
 on: [push, pull_request]
 
-name: Continuous integration
+name: CI
 
 jobs:
   test:
-    name: Test Suite
+    name: Test
     runs-on: ${{ matrix.os || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
@@ -21,16 +21,23 @@ jobs:
         include:
           - name: MSRV
             toolchain: 1.51.0
+            # don't do doctests because they rely on new features for brevity
+            command: cargo test --all-features --lib --tests --examples
           - name: beta
             toolchain: beta
           - name: nightly
             toolchain: nightly
           - name: macOS
             os: macOS-latest
+            # don't test simd-json feature because GHA macOS runners break trying to compile
+            # simd_json for a recent CPU
+            rustflags: " "
+            command: cargo test --features collector
           - name: Windows
             os: windows-latest
           - name: no features
-            feature_flags: --no-default-features --lib --tests # don't test example because it needs features
+            # don't test example because it needs features
+            command: cargo test --no-default-features --lib --tests
 
     steps:
       - uses: actions/checkout@v2
@@ -39,7 +46,9 @@ jobs:
           profile: minimal
           toolchain: ${{ matrix.toolchain || 'stable' }}
           override: true
-      - run: cargo test ${{ matrix.feature_flags || '--all-features' }}
+      - run: ${{ matrix.command || 'cargo test --all-features' }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags || '-C target-cpu=haswell' }}
 
   fmt:
     name: Rustfmt
@@ -68,4 +77,4 @@ jobs:
           toolchain: stable
           override: true
       - run: rustup component add clippy
-      - run: cargo clippy --all-features -- -D warnings
+      - run: RUSTFLAGS="-C target-cpu=haswell" cargo clippy --all-features -- -D warnings
