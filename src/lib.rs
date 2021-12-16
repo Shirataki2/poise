@@ -14,7 +14,7 @@ mod slash;
 pub use slash::*;
 
 mod event;
-pub use event::{Event, EventWrapper};
+pub use event::{Event as PoiseEvent, EventWrapper};
 
 mod structs;
 pub use structs::*;
