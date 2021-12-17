@@ -13,7 +13,7 @@ pub use prefix::*;
 mod slash;
 pub use slash::*;
 
-mod event;
+pub mod event;
 pub use event::{Event, EventWrapper};
 
 mod structs;
