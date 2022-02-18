@@ -1,112 +1,38 @@
+//! Dispatches interactions onto framework commands
+
 use crate::serenity_prelude as serenity;
 
-fn find_matching_application_command<'a, 'b, U, E>(
-    framework: &'a crate::Framework<U, E>,
-    interaction: &'b serenity::ApplicationCommandInteractionData,
+/// Check if the interaction with the given name and arguments matches any framework command
+fn find_matching_command<'a, 'b, U, E>(
+    interaction_name: &str,
+    interaction_options: &'b [serenity::ApplicationCommandInteractionDataOption],
+    commands: &'a [crate::Command<U, E>],
 ) -> Option<(
-    crate::ApplicationCommand<'a, U, E>,
+    &'a crate::Command<U, E>,
     &'b [serenity::ApplicationCommandInteractionDataOption],
 )> {
-    let commands = &framework.options.application_options.commands;
-    commands.iter().find_map(|cmd| match cmd {
-        crate::ApplicationCommandTree::ContextMenu(cmd) => {
-            let application_command_type = match &cmd.action {
-                crate::ContextMenuCommandAction::User(_) => serenity::ApplicationCommandType::User,
-                crate::ContextMenuCommandAction::Message(_) => {
-                    serenity::ApplicationCommandType::Message
-                }
-            };
-            if cmd.name == interaction.name && interaction.kind == application_command_type {
-                Some((
-                    crate::ApplicationCommand::ContextMenu(cmd),
-                    &*interaction.options,
-                ))
-            } else {
-                None
-            }
+    commands.iter().find_map(|cmd| {
+        if interaction_name != cmd.name && Some(interaction_name) != cmd.context_menu_name {
+            return None;
         }
-        // TODO: improve this monstrosity
-        crate::ApplicationCommandTree::Slash(cmd_meta) => match cmd_meta {
-            crate::SlashCommandMeta::Command(cmd) => {
-                if cmd.name == interaction.name
-                    && interaction.kind == serenity::ApplicationCommandType::ChatInput
-                {
-                    Some((crate::ApplicationCommand::Slash(cmd), &*interaction.options))
-                } else {
-                    None
-                }
-            }
-            // TODO: check name field perhaps?
-            crate::SlashCommandMeta::CommandGroup {
-                subcommands,
-                name: _,
-                description: _,
-                id: _,
-            } => {
-                if cmd_meta.name() != interaction.name {
-                    return None;
-                }
-                let interaction = match interaction.options.iter().find(|option| {
-                    option.kind == serenity::ApplicationCommandOptionType::SubCommand
-                        || option.kind == serenity::ApplicationCommandOptionType::SubCommandGroup
-                }) {
-                    Some(x) => x,
-                    None => {
-                        eprintln!("Expected slash subcommand, but Discord didn't send one");
-                        return None;
-                    }
-                };
 
-                subcommands.iter().find_map(|cmd| match cmd {
-                    crate::SlashCommandMeta::Command(cmd) => {
-                        if cmd.name == interaction.name {
-                            Some((crate::ApplicationCommand::Slash(cmd), &*interaction.options))
-                        } else {
-                            None
-                        }
-                    }
-                    // TODO: check name field perhaps?
-                    crate::SlashCommandMeta::CommandGroup {
-                        subcommands,
-                        name: _,
-                        description: _,
-                        id: _,
-                    } => {
-                        let interaction = match interaction.options.iter().find(|option| {
-                            option.kind == serenity::ApplicationCommandOptionType::SubCommand
-                                || option.kind
-                                    == serenity::ApplicationCommandOptionType::SubCommandGroup
-                        }) {
-                            Some(x) => x,
-                            None => {
-                                eprintln!("Expected slash subcommand, but Discord didn't send one");
-                                return None;
-                            }
-                        };
-
-                        subcommands.iter().find_map(|cmd| match cmd {
-                            crate::SlashCommandMeta::Command(cmd) => {
-                                if cmd.name == interaction.name {
-                                    Some((
-                                        crate::ApplicationCommand::Slash(cmd),
-                                        &*interaction.options,
-                                    ))
-                                } else {
-                                    None
-                                }
-                            }
-                            crate::SlashCommandMeta::CommandGroup { .. } => {
-                                // Discord doesn't send nested slash commands at this level anymore
-                                None
-                            }
-                        })
-                    }
-                })
-            }
-        },
+        if let Some(sub_interaction) = interaction_options.iter().find(|option| {
+            option.kind == serenity::ApplicationCommandOptionType::SubCommand
+                || option.kind == serenity::ApplicationCommandOptionType::SubCommandGroup
+        }) {
+            find_matching_command(
+                &sub_interaction.name,
+                &sub_interaction.options,
+                &cmd.subcommands,
+            )
+        } else {
+            Some((cmd, interaction_options))
+        }
     })
 }
 
+/// Given an interaction, finds the matching framework command and checks if the user is allowed
+/// access
 pub async fn extract_command_and_run_checks<'a, U, E>(
     framework: &'a crate::Framework<U, E>,
     ctx: &'a serenity::Context,
@@ -117,19 +43,23 @@ pub async fn extract_command_and_run_checks<'a, U, E>(
         crate::ApplicationContext<'a, U, E>,
         &'a [serenity::ApplicationCommandInteractionDataOption],
     ),
-    Option<(E, crate::ApplicationCommandErrorContext<'a, U, E>)>,
+    Option<(crate::FrameworkError<'a, U, E>, &'a crate::Command<U, E>)>,
 > {
-    let (command, leaf_interaction_options) =
-        find_matching_application_command(framework, interaction.data()).ok_or_else(|| {
-            println!(
-                "Warning: received unknown interaction \"{}\"",
-                interaction.data().name
-            );
-            None
-        })?;
+    let search_result = find_matching_command(
+        &interaction.data().name,
+        &interaction.data().options,
+        &framework.options.commands,
+    );
+    let (command, leaf_interaction_options) = search_result.ok_or_else(|| {
+        println!(
+            "Warning: received unknown interaction \"{}\"",
+            interaction.data().name
+        );
+        None
+    })?;
 
     let ctx = crate::ApplicationContext {
-        data: framework.get_user_data().await,
+        data: framework.user_data().await,
         discord: ctx,
         framework,
         interaction,
@@ -137,26 +67,21 @@ pub async fn extract_command_and_run_checks<'a, U, E>(
         has_sent_initial_response,
     };
 
-    let perms_and_cooldown_ok =
-        super::common::check_permissions_and_cooldown(ctx.into(), command.id())
-            .await
-            .map_err(|(e, location)| {
-                Some((e, crate::ApplicationCommandErrorContext { ctx, location }))
-            })?;
-    if !perms_and_cooldown_ok {
-        return Err(None);
-    }
+    super::common::check_permissions_and_cooldown(ctx.into(), command)
+        .await
+        .map_err(|e| Some((e, command)))?;
 
     Ok((ctx, leaf_interaction_options))
 }
 
+/// Dispatches this interaction onto framework commands, i.e. runs the associated command
 pub async fn dispatch_interaction<'a, U, E>(
     framework: &'a crate::Framework<U, E>,
     ctx: &'a serenity::Context,
     interaction: &'a serenity::ApplicationCommandInteraction,
     // Need to pass this in from outside because of lifetime issues
     has_sent_initial_response: &'a std::sync::atomic::AtomicBool,
-) -> Result<(), Option<(E, crate::ApplicationCommandErrorContext<'a, U, E>)>> {
+) -> Result<(), Option<(crate::FrameworkError<'a, U, E>, &'a crate::Command<U, E>)>> {
     let (ctx, options) = extract_command_and_run_checks(
         framework,
         ctx,
@@ -167,46 +92,59 @@ pub async fn dispatch_interaction<'a, U, E>(
 
     (framework.options.pre_command)(crate::Context::Application(ctx)).await;
 
-    let action_result = match ctx.command {
-        crate::ApplicationCommand::Slash(cmd) => (cmd.action)(ctx, options).await,
-        crate::ApplicationCommand::ContextMenu(cmd) => match cmd.action {
-            crate::ContextMenuCommandAction::User(action) => match &interaction.data.target {
-                Some(serenity::ResolvedTarget::User(user, _)) => (action)(ctx, user.clone()).await,
-                _ => {
-                    println!("Warning: no user object sent in user context menu interaction");
-                    return Ok(());
-                }
-            },
-            crate::ContextMenuCommandAction::Message(action) => match &interaction.data.target {
-                Some(serenity::ResolvedTarget::Message(msg)) => (action)(ctx, msg.clone()).await,
-                _ => {
-                    println!("Warning: no message object sent in message context menu interaction");
-                    return Ok(());
-                }
-            },
+    // Check which interaction type we received and grab the command action and, if context menu,
+    // the resolved click target, and execute the action
+    let command_structure_mismatch_error = Some((
+        crate::FrameworkError::CommandStructureMismatch {
+            ctx,
+            description: "received interaction type but command contained no \
+                matching action or interaction contained no matching context menu object",
         },
+        ctx.command,
+    ));
+    let action_result = match interaction.data.kind {
+        serenity::ApplicationCommandType::ChatInput => {
+            let action = ctx
+                .command
+                .slash_action
+                .ok_or(command_structure_mismatch_error)?;
+            action(ctx, options).await
+        }
+        serenity::ApplicationCommandType::User => {
+            match (ctx.command.context_menu_action, &interaction.data.target) {
+                (
+                    Some(crate::ContextMenuCommandAction::User(action)),
+                    Some(serenity::ResolvedTarget::User(user, _)),
+                ) => action(ctx, user.clone()).await,
+                _ => return Err(command_structure_mismatch_error),
+            }
+        }
+        serenity::ApplicationCommandType::Message => {
+            match (ctx.command.context_menu_action, &interaction.data.target) {
+                (
+                    Some(crate::ContextMenuCommandAction::Message(action)),
+                    Some(serenity::ResolvedTarget::Message(message)),
+                ) => action(ctx, message.clone()).await,
+                _ => return Err(command_structure_mismatch_error),
+            }
+        }
+        _ => return Err(None),
     };
 
     (framework.options.post_command)(crate::Context::Application(ctx)).await;
 
-    action_result.map_err(|e| {
-        Some((
-            e,
-            crate::ApplicationCommandErrorContext {
-                ctx,
-                location: crate::CommandErrorLocation::Body,
-            },
-        ))
-    })
+    action_result.map_err(|e| Some((e, ctx.command)))
 }
 
+/// Dispatches this interaction onto framework commands, i.e. runs the associated autocomplete
+/// callback
 pub async fn dispatch_autocomplete<'a, U, E>(
     framework: &'a crate::Framework<U, E>,
     ctx: &'a serenity::Context,
     interaction: &'a serenity::AutocompleteInteraction,
     // Need to pass this in from outside because of lifetime issues
     has_sent_initial_response: &'a std::sync::atomic::AtomicBool,
-) -> Result<(), Option<(E, crate::ApplicationCommandErrorContext<'a, U, E>)>> {
+) -> Result<(), Option<(crate::FrameworkError<'a, U, E>, &'a crate::Command<U, E>)>> {
     let (ctx, options) = extract_command_and_run_checks(
         framework,
         ctx,
@@ -215,28 +153,37 @@ pub async fn dispatch_autocomplete<'a, U, E>(
     )
     .await?;
 
-    let command = match ctx.command {
-        crate::ApplicationCommand::Slash(x) => x,
-        crate::ApplicationCommand::ContextMenu(_) => return Err(None),
-    };
+    // Find which parameter is focused by the user
+    let focused_option = options.iter().find(|o| o.focused).ok_or(None)?;
 
-    for param in &command.parameters {
-        let autocomplete_callback = match param.autocomplete_callback {
-            Some(x) => x,
-            None => continue,
+    // Find the matching parameter from our Command object
+    let parameters = &ctx.command.parameters;
+    let focused_parameter = parameters
+        .iter()
+        .find(|p| p.name == focused_option.name)
+        .ok_or(None)?;
+
+    // If this parameter supports autocomplete...
+    if let Some(autocomplete_callback) = focused_parameter.autocomplete_callback {
+        // Generate an autocomplete response
+        let focused_option_json = focused_option.value.as_ref().ok_or(None)?;
+        let autocomplete_response = match autocomplete_callback(ctx, focused_option_json).await {
+            Ok(x) => x,
+            Err(e) => {
+                println!("Warning: couldn't generate autocomplete response: {}", e);
+                return Err(None);
+            }
         };
 
-        if let Err(e) = autocomplete_callback(ctx, interaction, options).await {
-            let error_ctx = crate::ApplicationCommandErrorContext {
-                ctx,
-                location: crate::CommandErrorLocation::Autocomplete,
-            };
-
-            if let Some(on_error) = error_ctx.ctx.command.id().on_error {
-                on_error(e, crate::CommandErrorContext::Application(error_ctx)).await;
-            } else {
-                (framework.options.on_error)(e, crate::ErrorContext::Autocomplete(error_ctx)).await;
-            }
+        // Send the generates autocomplete response
+        if let Err(e) = interaction
+            .create_autocomplete_response(&ctx.discord.http, |b| {
+                *b = autocomplete_response;
+                b
+            })
+            .await
+        {
+            println!("Warning: couldn't send autocomplete response: {}", e);
         }
     }
 

@@ -131,11 +131,9 @@ async fn register(ctx: Context<'_>, #[flag] global: bool) -> Result<(), Error> {
 }
 
 async fn pre_command(ctx: Context<'_>) {
-    let command_name = ctx.command().map_or("<unknown>", |cmd| cmd.name());
-
     println!(
         "Got command '{}' by user '{}'",
-        command_name,
+        ctx.command().name,
         ctx.author().name
     );
 
@@ -143,12 +141,14 @@ async fn pre_command(ctx: Context<'_>) {
     // the command's name does not exist in the counter, add a default
     // value of 0.
     let mut command_counter = ctx.data().command_counter.lock().unwrap();
-    let entry = command_counter.entry(command_name.to_string()).or_insert(0);
+    let entry = command_counter
+        .entry(ctx.command().name.to_string())
+        .or_insert(0);
     *entry += 1;
 }
 
 async fn post_command(ctx: Context<'_>) {
-    println!("Processed command '{}'", ctx.command().unwrap().name());
+    println!("Processed command '{}'", ctx.command().name);
 }
 
 // TODO: unify the command checks in poise::FrameworkOptions and then implement a command check here
@@ -157,23 +157,27 @@ async fn post_command(ctx: Context<'_>) {
 // true // if `check` returns false, command processing doesn't happen.
 // ```
 
-async fn on_error(error: Error, ctx: poise::ErrorContext<'_, Data, Error>) {
-    match ctx {
-        poise::ErrorContext::Command(ctx) => {
+async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
+    match error {
+        poise::FrameworkError::Command { error, ctx } => {
             println!(
                 "Command '{}' returned error {:?}",
-                ctx.command().name(),
+                ctx.command().name,
                 error
             );
         }
-        poise::ErrorContext::Listener(event) => {
+        poise::FrameworkError::Listener { error, event } => {
             println!(
-                "Listener returned error during {} event: {:?}",
+                "Listener returned error during {:?} event: {:?}",
                 event.name(),
                 error
             );
         }
-        _ => {}
+        error => {
+            if let Err(e) = poise::builtins::on_error(error).await {
+                println!("Error while handling error: {}", e)
+            }
+        }
     }
 }
 
@@ -232,10 +236,39 @@ fn _dispatch_error_no_macro<'fut>(
 #[tokio::main]
 async fn main() {
     let options = poise::FrameworkOptions {
+        commands: vec![
+            // The `#[poise::command(prefix_command, slash_command)]` macro transforms the function into
+            // `fn() -> poise::Command`.
+            // Therefore, you need to call the command function without any arguments to get the
+            // command definition instance to pass to the framework
+            help(),
+            // This function registers slash commands on Discord. When you change something about a
+            // command signature, for example by changing its name, adding or removing parameters, or
+            // changing a parameter type, you should call this function.
+            register(),
+            about(),
+            am_i_admin(),
+            say(),
+            commands(),
+            ping(),
+            latency(),
+            some_long_command(),
+            poise::Command {
+                // A command can have sub-commands, just like in command lines tools.
+                // Imagine `cargo help` and `cargo help run`.
+                subcommands: vec![sub()],
+                ..upper_command()
+            },
+            bird(),
+            cat(),
+            dog(),
+            multiply(),
+            slow_mode(),
+        ],
         listener: |ctx, event, framework, user_data| {
             Box::pin(event_listener(ctx, event, framework, user_data))
         },
-        on_error: |error, ctx| Box::pin(on_error(error, ctx)),
+        on_error: |error| Box::pin(on_error(error)),
         // Set a function to be called prior to each command execution. This
         // provides all context of the command that would also be passed to the actual command code
         pre_command: |ctx| Box::pin(pre_command(ctx)),
@@ -271,33 +304,6 @@ async fn main() {
                 })
             })
         })
-        // The `#[poise::command(prefix_command, slash_command)]` macro transforms the function into
-        // `fn() -> poise::CommandDefinition`.
-        // Therefore, you need to call the command function without any arguments to get the
-        // command definition instance to pass to the framework
-        .command(help(), |f| f)
-        // This function registers slash commands on Discord. When you change something about a
-        // command signature, for example by changing its name, adding or removing parameters, or
-        // changing a parameter type, you should call this function.
-        .command(register(), |f| f)
-        .command(about(), |f| f)
-        .command(am_i_admin(), |f| f)
-        .command(say(), |f| f)
-        .command(commands(), |f| f)
-        .command(ping(), |f| f)
-        .command(latency(), |f| f)
-        .command(some_long_command(), |f| f)
-        .command(upper_command(), |f| {
-            // A command can have sub-commands, just like in command lines tools.
-            // Imagine `cargo help` and `cargo help run`.
-            // Subcommands are also specified here, inside the builder
-            f.subcommand(sub(), |f| f)
-        })
-        .command(bird(), |f| f)
-        .command(cat(), |f| f)
-        .command(dog(), |f| f)
-        .command(multiply(), |f| f)
-        .command(slow_mode(), |f| f)
         .run()
         .await
         .expect("Client error");
@@ -603,25 +609,20 @@ async fn am_i_admin(ctx: Context<'_>) -> Result<(), Error> {
 )]
 async fn slow_mode(
     ctx: Context<'_>,
-    #[description = "How long users have to wait inbetween sending messages"]
-    slow_mode_rate_seconds: Option<u64>,
+    #[description = "Minimum time between sending messages per user"] rate_limit: Option<u64>,
 ) -> Result<(), Error> {
-    let say_content = if let Some(slow_mode_rate_seconds) = slow_mode_rate_seconds {
+    let say_content = if let Some(rate_limit) = rate_limit {
         if let Err(why) = ctx
             .channel_id()
-            .edit(ctx.discord(), |c| c.slow_mode_rate(slow_mode_rate_seconds))
+            .edit(ctx.discord(), |c| c.rate_limit_per_user(rate_limit))
             .await
         {
             println!("Error setting channel's slow mode rate: {:?}", why);
-
-            format!(
-                "Failed to set slow mode to `{}` seconds.",
-                slow_mode_rate_seconds
-            )
+            format!("Failed to set slow mode to `{}` seconds.", rate_limit)
         } else {
             format!(
                 "Successfully set slow mode rate to `{}` seconds.",
-                slow_mode_rate_seconds
+                rate_limit
             )
         }
     } else if let Some(serenity::Channel::Guild(channel)) =
@@ -629,7 +630,7 @@ async fn slow_mode(
     {
         format!(
             "Current slow mode rate is `{}` seconds.",
-            channel.slow_mode_rate.unwrap_or(0)
+            channel.rate_limit_per_user.unwrap_or(0)
         )
     } else {
         "Failed to find channel in cache.".to_string()

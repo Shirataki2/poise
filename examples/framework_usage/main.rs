@@ -1,6 +1,10 @@
+#![warn(clippy::str_to_string)]
+
 mod autocomplete;
+mod checks;
 mod commands;
 mod context_menu;
+mod subcommands;
 
 use std::{collections::HashMap, env::var, sync::Mutex, time::Duration};
 
@@ -45,19 +49,57 @@ async fn register(ctx: Context<'_>, #[flag] global: bool) -> Result<(), Error> {
     Ok(())
 }
 
-async fn on_error(error: Error, ctx: poise::ErrorContext<'_, Data, Error>) {
-    match ctx {
-        poise::ErrorContext::Setup => panic!("Failed to start bot: {:?}", error),
-        poise::ErrorContext::Command(ctx) => {
-            println!("Error in command `{}`: {:?}", ctx.command().name(), error)
+async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
+    // This is our custom error handler
+    // They are many errors that can occur, so we only handle the ones we want to customize
+    // and forward the rest to the default handler
+    match error {
+        poise::FrameworkError::Setup { error } => panic!("Failed to start bot: {:?}", error),
+        poise::FrameworkError::Command { error, ctx } => {
+            println!("Error in command `{}`: {:?}", ctx.command().name, error,);
         }
-        _ => println!("Other error: {:?}", error),
+        error => {
+            if let Err(e) = poise::builtins::on_error(error).await {
+                println!("Error while handling error: {}", e)
+            }
+        }
     }
 }
 
 #[tokio::main]
 async fn main() {
     let options = poise::FrameworkOptions {
+        commands: vec![
+            help(),
+            register(),
+            commands::vote(),
+            commands::getvotes(),
+            commands::addmultiple(),
+            commands::choice(),
+            commands::boop(),
+            commands::voiceinfo(),
+            commands::test_reuse_response(),
+            commands::oracle(),
+            commands::code(),
+            commands::say(),
+            context_menu::user_info(),
+            context_menu::echo(),
+            autocomplete::greet(),
+            checks::shutdown(),
+            checks::modonly(),
+            checks::delete(),
+            checks::ferrisparty(),
+            checks::add(),
+            poise::Command {
+                subcommands: vec![
+                    subcommands::child1(),
+                    subcommands::child2(),
+                    // Let's make sure poise isn't confused by the duplicate names!
+                    subcommands::parent(),
+                ],
+                ..subcommands::parent()
+            },
+        ],
         prefix_options: poise::PrefixFrameworkOptions {
             prefix: Some("~".into()),
             edit_tracker: Some(poise::EditTracker::for_timespan(Duration::from_secs(3600))),
@@ -67,17 +109,29 @@ async fn main() {
             ],
             ..Default::default()
         },
-        on_error: |error, ctx| Box::pin(on_error(error, ctx)),
+        /// The global error handler for all error cases that may occur
+        on_error: |error| Box::pin(on_error(error)),
+        /// This code is ran before every command
         pre_command: |ctx| {
             Box::pin(async move {
-                println!("Executing command {}...", ctx.command().unwrap().name());
+                println!("Executing command {}...", ctx.command().qualified_name);
             })
         },
+        /// This code is ran after every command, regardless of whether it returned an error
         post_command: |ctx| {
             Box::pin(async move {
-                println!("Executed command {}!", ctx.command().unwrap().name());
+                println!("Executed command {}!", ctx.command().qualified_name);
             })
         },
+        /// Every command invocation must pass this check to continue execution
+        command_check: Some(|ctx| {
+            Box::pin(async move {
+                if ctx.author().id == 123456789 {
+                    return Ok(false);
+                }
+                Ok(true)
+            })
+        }),
         ..Default::default()
     };
 
@@ -91,17 +145,6 @@ async fn main() {
             })
         })
         .options(options)
-        .command(help(), |f| f)
-        .command(register(), |f| f)
-        .command(commands::vote(), |f| f)
-        .command(commands::getvotes(), |f| f)
-        .command(commands::add(), |f| f)
-        .command(commands::choice(), |f| f)
-        .command(commands::boop(), |f| f)
-        .command(commands::delete(), |f| f)
-        .command(context_menu::user_info(), |f| f)
-        .command(context_menu::echo(), |f| f)
-        .command(autocomplete::greet(), |f| f)
         .run()
         .await
         .unwrap();

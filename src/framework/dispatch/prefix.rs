@@ -1,6 +1,10 @@
+//! Dispatches incoming messages and message edits onto framework commands
+
 use crate::serenity_prelude as serenity;
 
-// Returns tuple of stripped prefix and rest of the message, if any prefix matches
+/// Checks if this message is a bot invocation by attempting to strip the prefix
+///
+/// Returns tuple of stripped prefix and rest of the message, if any prefix matches
 async fn strip_prefix<'a, U, E>(
     framework: &'a crate::Framework<U, E>,
     ctx: &'a serenity::Context,
@@ -13,7 +17,7 @@ async fn strip_prefix<'a, U, E>(
             author: &msg.author,
             discord: ctx,
             framework,
-            data: framework.get_user_data().await,
+            data: framework.user_data().await,
         };
         if let Some(prefix) = dynamic_prefix(partial_ctx).await {
             if msg.content.starts_with(&prefix) {
@@ -49,8 +53,7 @@ async fn strip_prefix<'a, U, E>(
     }
 
     if let Some(dynamic_prefix) = framework.options.prefix_options.stripped_dynamic_prefix {
-        if let Some((prefix, content)) =
-            dynamic_prefix(ctx, msg, framework.get_user_data().await).await
+        if let Some((prefix, content)) = dynamic_prefix(ctx, msg, framework.user_data().await).await
         {
             return Some((prefix, content));
         }
@@ -73,41 +76,43 @@ async fn strip_prefix<'a, U, E>(
     None
 }
 
-/// Find a command within nested PrefixCommandMeta's by the user message string. Also returns
-/// the arguments, i.e. the remaining string.
-fn find_command<'a, U, E>(
-    framework: &'a crate::Framework<U, E>,
-    ctx: &'a serenity::Context,
-    msg: &'a serenity::Message,
-    prefix: &'a str,
-    commands: &'a [crate::PrefixCommandMeta<U, E>],
+/// Find a command or subcommand within `&[Command]`, given a command invocation without a prefix.
+/// Returns the verbatim command name string as well as the command arguments (i.e. the remaining
+/// string).
+///
+/// ```rust
+/// #[poise::command(prefix_command)] async fn command1(ctx: poise::Context<'_, (), ()>) -> Result<(), ()> { Ok(()) }
+/// #[poise::command(prefix_command)] async fn command2(ctx: poise::Context<'_, (), ()>) -> Result<(), ()> { Ok(()) }
+/// #[poise::command(prefix_command)] async fn command3(ctx: poise::Context<'_, (), ()>) -> Result<(), ()> { Ok(()) }
+/// let commands = vec![
+///     command1(),    
+///     poise::Command {
+///         subcommands: vec![command3()],
+///         ..command2()
+///     },
+/// ];
+///
+/// assert_eq!(
+///     poise::find_command(&commands, "command1 my arguments", false),
+///     Some((&commands[0], "command1", "my arguments")),
+/// );
+/// assert_eq!(
+///     poise::find_command(&commands, "command2 command3 my arguments", false),
+///     Some((&commands[1].subcommands[0], "command3", "my arguments")),
+/// );
+/// assert_eq!(
+///     poise::find_command(&commands, "CoMmAnD2 cOmMaNd99 my arguments", true),
+///     Some((&commands[1], "CoMmAnD2", "cOmMaNd99 my arguments")),
+/// );
+pub fn find_command<'a, U, E>(
+    commands: &'a [crate::Command<U, E>],
     remaining_message: &'a str,
-) -> crate::BoxFuture<'a, Option<(&'a crate::PrefixCommandMeta<U, E>, &'a str)>>
+    case_insensitive: bool,
+) -> Option<(&'a crate::Command<U, E>, &'a str, &'a str)>
 where
     U: Send + Sync,
 {
-    Box::pin(_find_command(
-        framework,
-        ctx,
-        msg,
-        prefix,
-        commands,
-        remaining_message,
-    ))
-}
-
-async fn _find_command<'a, U, E>(
-    framework: &'a crate::Framework<U, E>,
-    ctx: &'a serenity::Context,
-    msg: &'a serenity::Message,
-    prefix: &'a str,
-    commands: &'a [crate::PrefixCommandMeta<U, E>],
-    remaining_message: &'a str,
-) -> Option<(&'a crate::PrefixCommandMeta<U, E>, &'a str)>
-where
-    U: Send + Sync,
-{
-    let considered_equal = if framework.options.prefix_options.case_insensitive_commands {
+    let string_equal = if case_insensitive {
         |a: &str, b: &str| a.eq_ignore_ascii_case(b)
     } else {
         |a: &str, b: &str| a == b
@@ -118,47 +123,26 @@ where
         (iter.next().unwrap(), iter.next().unwrap_or("").trim_start())
     };
 
-    let mut first_matching_command = None;
-    for command_meta in commands {
-        let command = &command_meta.command;
-
-        let primary_name_matches = considered_equal(command.name, command_name);
+    for command in commands {
+        let primary_name_matches = string_equal(command.name, command_name);
         let alias_matches = command
             .aliases
             .iter()
-            .any(|alias| considered_equal(alias, command_name));
+            .any(|alias| string_equal(alias, command_name));
         if !primary_name_matches && !alias_matches {
             continue;
         }
 
-        let ctx = crate::PrefixContext {
-            discord: ctx,
-            msg,
-            prefix,
-            framework,
-            data: framework.get_user_data().await,
-            command: Some(&command_meta.command),
-        };
-
-        first_matching_command = Some(
-            match find_command(
-                framework,
-                ctx.discord,
-                msg,
-                prefix,
-                &command_meta.subcommands,
+        return Some(
+            find_command(&command.subcommands, remaining_message, case_insensitive).unwrap_or((
+                command,
+                command_name,
                 remaining_message,
-            )
-            .await
-            {
-                Some((subcommand_meta, remaining_message)) => (subcommand_meta, remaining_message),
-                None => (command_meta, remaining_message),
-            },
+            )),
         );
-        break;
     }
 
-    first_matching_command
+    None
 }
 
 /// Manually dispatches a message with the prefix framework.
@@ -174,7 +158,7 @@ pub async fn dispatch_message<'a, U, E>(
     msg: &'a serenity::Message,
     triggered_by_edit: bool,
     previously_tracked: bool,
-) -> Result<(), Option<(E, crate::PrefixCommandErrorContext<'a, U, E>)>>
+) -> Result<(), Option<(crate::FrameworkError<'a, U, E>, &'a crate::Command<U, E>)>>
 where
     U: Send + Sync,
 {
@@ -189,20 +173,16 @@ where
         return Err(None);
     }
 
-    let (command_meta, args) = find_command(
-        framework,
-        ctx,
-        msg,
-        prefix,
-        &framework.options.prefix_options.commands,
+    let (command, invoked_command_name, args) = find_command(
+        &framework.options.commands,
         msg_content,
+        framework.options.prefix_options.case_insensitive_commands,
     )
-    .await
     .ok_or(None)?;
-    let command = &command_meta.command;
+    let action = command.prefix_action.ok_or(None)?;
 
     // Check if we should disregard this invocation if it was triggered by an edit
-    let should_execute_if_triggered_by_edit = command.track_edits
+    let should_execute_if_triggered_by_edit = command.invoke_on_edit
         || (!previously_tracked && framework.options.prefix_options.execute_untracked_edits);
     if triggered_by_edit && !should_execute_if_triggered_by_edit {
         return Err(None);
@@ -212,27 +192,15 @@ where
         discord: ctx,
         msg,
         prefix,
+        invoked_command_name,
         framework,
-        data: framework.get_user_data().await,
-        command: Some(command),
+        data: framework.user_data().await,
+        command,
     };
 
-    let perms_and_cooldown_ok =
-        super::common::check_permissions_and_cooldown(ctx.into(), &command.id)
-            .await
-            .map_err(|(e, location)| {
-                Some((
-                    e,
-                    crate::PrefixCommandErrorContext {
-                        ctx,
-                        command,
-                        location,
-                    },
-                ))
-            })?;
-    if !perms_and_cooldown_ok {
-        return Err(None);
-    }
+    super::common::check_permissions_and_cooldown(ctx.into(), command)
+        .await
+        .map_err(|e| Some((e, command)))?;
 
     // Typing is broadcasted as long as this object is alive
     let _typing_broadcaster = if command.broadcast_typing {
@@ -244,16 +212,7 @@ where
     (framework.options.pre_command)(crate::Context::Prefix(ctx)).await;
 
     // Execute command
-    let res = (command.action)(ctx, args).await.map_err(|e| {
-        Some((
-            e,
-            crate::PrefixCommandErrorContext {
-                ctx,
-                command,
-                location: crate::CommandErrorLocation::Check,
-            },
-        ))
-    });
+    let res = (action)(ctx, args).await.map_err(|e| Some((e, command)));
 
     (framework.options.post_command)(crate::Context::Prefix(ctx)).await;
 

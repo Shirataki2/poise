@@ -7,45 +7,112 @@ mod help;
 pub use help::*;
 
 use crate::serenity_prelude as serenity;
-type BoxErrorSendSync = Box<dyn std::error::Error + Send + Sync>;
 
 /// An error handler that prints the error into the console and also into the Discord chat.
-/// If the user invoked the command wrong
-/// (i.e. an [`crate::ArgumentParseError`]), the command help is displayed and the user is directed
-/// to the help menu.
-pub async fn on_error<D>(e: BoxErrorSendSync, ctx: crate::ErrorContext<'_, D, BoxErrorSendSync>) {
-    println!("Encountered an error: {:?}", e);
-    match ctx {
-        crate::ErrorContext::Command(ctx) => {
-            let user_error_msg = if let Some(crate::ArgumentParseError(e)) = e.downcast_ref() {
-                // If we caught an argument parse error, give a helpful error message with the
-                // command explanation if available
-
-                let mut usage = "Please check the help menu for usage information".into();
-                if let Some(multiline_help) = &ctx.command().id().multiline_help {
-                    usage = multiline_help();
-                }
-                format!("**{}**\n{}", e, usage)
-            } else {
-                e.to_string()
+/// If the user invoked the command wrong ([`crate::FrameworkError::ArgumentParse`]), the command
+/// help is displayed and the user is directed to the help menu.
+///
+/// Can return an error if sending the Discord error message failed. You can decide for yourself
+/// how to handle this, for example:
+/// ```rust,no_run
+/// # async { let error: poise::FrameworkError<'_, (), &str> = todo!();
+/// if let Err(e) = poise::builtins::on_error(error).await {
+///     println!("Fatal error while sending error message: {}", e);
+/// }
+/// # };
+/// ```
+pub async fn on_error<U, E: std::fmt::Display + std::fmt::Debug>(
+    error: crate::FrameworkError<'_, U, E>,
+) -> Result<(), serenity::Error> {
+    match error {
+        crate::FrameworkError::Setup { error } => println!("Error in user data setup: {}", error),
+        crate::FrameworkError::Listener { error, event } => println!(
+            "User event listener encountered an error on {} event: {}",
+            event.name(),
+            error
+        ),
+        crate::FrameworkError::Command { ctx, error } => {
+            let error = error.to_string();
+            ctx.say(error).await?;
+        }
+        crate::FrameworkError::ArgumentParse { ctx, input, error } => {
+            // If we caught an argument parse error, give a helpful error message with the
+            // command explanation if available
+            let usage = match ctx.command().multiline_help {
+                Some(multiline_help) => multiline_help(),
+                None => "Please check the help menu for usage information".into(),
             };
-            if let Err(e) = ctx.ctx().say(user_error_msg).await {
-                println!("Error while user command error: {}", e);
-            }
+            let response = if let Some(input) = input {
+                format!(
+                    "**Cannot parse `{}` as argument: {}**\n{}",
+                    input, error, usage
+                )
+            } else {
+                format!("**{}**\n{}", error, usage)
+            };
+            ctx.say(response).await?;
         }
-        crate::ErrorContext::Listener(event) => {
-            println!("Error in listener while processing {:?}: {}", event, e)
-        }
-        crate::ErrorContext::Autocomplete(err_ctx) => {
-            let ctx = err_ctx.ctx;
+        crate::FrameworkError::CommandStructureMismatch { ctx, description } => {
             println!(
-                "Error in autocomplete callback for command {:?}: {}",
-                ctx.command.slash_or_context_menu_name(),
-                e
-            )
+                "Error: failed to deserialize interaction arguments for `/{}`: {}",
+                ctx.command.name, description,
+            );
         }
-        crate::ErrorContext::Setup => println!("Setup failed: {}", e),
+        crate::FrameworkError::CommandCheckFailed { ctx, error } => {
+            println!(
+                "A command check failed in command {} for user {}: {:?}",
+                ctx.command().name,
+                ctx.author().name,
+                error,
+            );
+        }
+        crate::FrameworkError::CooldownHit {
+            remaining_cooldown,
+            ctx,
+        } => {
+            let msg = format!(
+                "You're too fast. Please wait {} seconds before retrying",
+                remaining_cooldown.as_secs()
+            );
+            ctx.send(|b| b.content(msg).ephemeral(true)).await?;
+        }
+        crate::FrameworkError::MissingBotPermissions {
+            missing_permissions,
+            ctx,
+        } => {
+            let msg = format!(
+                "Command cannot be executed because the bot is lacking permissions: {}",
+                missing_permissions,
+            );
+            ctx.send(|b| b.content(msg).ephemeral(true)).await?;
+        }
+        crate::FrameworkError::MissingUserPermissions {
+            missing_permissions,
+            ctx,
+        } => {
+            let response = if let Some(missing_permissions) = missing_permissions {
+                format!(
+                    "You're lacking permissions for `{}{}`: {}",
+                    ctx.prefix(),
+                    ctx.command().name,
+                    missing_permissions,
+                )
+            } else {
+                format!(
+                    "You may be lacking permissions for `{}{}`. Not executing for safety",
+                    ctx.prefix(),
+                    ctx.command().name,
+                )
+            };
+            ctx.send(|b| b.content(response).ephemeral(true)).await?;
+        }
+        crate::FrameworkError::NotAnOwner { ctx } => {
+            let response = "Only bot owners can call this command";
+            ctx.send(|b| b.content(response).ephemeral(true)).await?;
+        }
     }
+
+    Ok(())
 }
 
 /// An autocomplete function that can be used for the command parameter in your help function.
@@ -55,20 +122,19 @@ pub async fn autocomplete_command<U, E>(
     ctx: crate::Context<'_, U, E>,
     partial: String,
 ) -> impl Iterator<Item = String> + '_ {
-    // We only consider prefix commands here because, bad as it is, that's what other builtins
-    // do to. For example the help command only shows commands that have a prefix version.
-    // Once a better command structure design is adopted, this issue should be solved
     ctx.framework()
         .options()
-        .prefix_options
         .commands
         .iter()
-        .filter(move |cmd| cmd.command.name.starts_with(&partial))
-        .map(|cmd| cmd.command.name.to_string())
+        .filter(move |cmd| cmd.name.starts_with(&partial))
+        .map(|cmd| cmd.name.to_string())
 }
 
-/// Generic function to register application commands, either globally or in a guild. Only bot
-/// owners can register globally, only guild owners can register in guild.
+/// Generic function to register application commands, either globally or in a guild.
+///
+/// Some permission checks are built in:
+/// - global command registration is only allowed for bot owners
+/// - guild-specific command registration is allowed for guild owners and bot owners
 ///
 /// If you want, you can copy paste this help message:
 ///
@@ -82,15 +148,19 @@ pub async fn register_application_commands<U, E>(
     global: bool,
 ) -> Result<(), serenity::Error> {
     let mut commands_builder = serenity::CreateApplicationCommands::default();
-    let commands = &ctx.framework().options().application_options.commands;
-    for cmd in commands {
-        commands_builder.create_application_command(|f| cmd.create(f));
+    let commands = &ctx.framework().options().commands;
+    for command in commands {
+        if let Some(slash_command) = command.create_as_slash_command() {
+            commands_builder.add_application_command(slash_command);
+        }
+        if let Some(context_menu_command) = command.create_as_context_menu_command() {
+            commands_builder.add_application_command(context_menu_command);
+        }
     }
     let commands_builder = serenity::json::Value::Array(commands_builder.0);
 
+    let is_bot_owner = ctx.framework().options().owners.contains(&ctx.author().id);
     if global {
-        let is_bot_owner = ctx.framework().options().owners.contains(&ctx.author().id);
-
         if !is_bot_owner {
             ctx.say("Can only be used by bot owner").await?;
             return Ok(());
@@ -112,7 +182,7 @@ pub async fn register_application_commands<U, E>(
         };
         let is_guild_owner = ctx.author().id == guild.owner_id;
 
-        if !is_guild_owner {
+        if !is_guild_owner && !is_bot_owner {
             ctx.say("Can only be used by server owner").await?;
             return Ok(());
         }
@@ -152,9 +222,13 @@ pub async fn servers<U, E>(ctx: crate::Context<'_, U, E>) -> Result<(), serenity
         }
     }
 
+    /// Stores details of a guild for the purposes of listing it in the bot guild list
     struct Guild {
+        /// Name of the guild
         name: String,
+        /// Number of members in the guild
         num_members: u64,
+        /// Whether the guild is public
         is_public: bool,
     }
 

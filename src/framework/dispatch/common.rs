@@ -1,3 +1,5 @@
+//! Prefix and slash agnostic utilities for dispatching incoming events onto framework commands
+
 use crate::serenity_prelude as serenity;
 
 /// Retrieves user permissions in the given channel. If unknown, returns None. If in DMs, returns
@@ -18,15 +20,16 @@ async fn user_permissions(
         None => return None, // Guild not in cache
     };
 
-    let channel = match guild.channels.get(&channel_id) {
-        Some(serenity::Channel::Guild(channel)) => channel,
-        Some(_other_channel) => {
+    // Use to_channel so that it can fallback on HTTP for threads (which aren't in cache usually)
+    let channel = match channel_id.to_channel(ctx).await {
+        Ok(serenity::Channel::Guild(channel)) => channel,
+        Ok(_other_channel) => {
             println!(
                 "Warning: guild message was supposedly sent in a non-guild channel. Denying invocation"
             );
             return None;
         }
-        None => return None,
+        Err(_) => return None,
     };
 
     // If member not in cache (probably because presences intent is not enabled), retrieve via HTTP
@@ -38,116 +41,97 @@ async fn user_permissions(
         },
     };
 
-    guild.user_permissions_in(channel, &member).ok()
+    guild.user_permissions_in(&channel, &member).ok()
 }
 
-async fn check_required_permissions_and_owners_only<U, E>(
+/// Retrieves the set of permissions that are lacking, relative to the given required permission set
+///
+/// Returns None if permissions couldn't be retrieved
+async fn missing_permissions<U, E>(
     ctx: crate::Context<'_, U, E>,
+    user: serenity::UserId,
     required_permissions: serenity::Permissions,
-    owners_only: bool,
-) -> bool {
-    if owners_only && !ctx.framework().options().owners.contains(&ctx.author().id) {
-        return false;
+) -> Option<serenity::Permissions> {
+    if required_permissions.is_empty() {
+        return Some(serenity::Permissions::empty());
     }
 
-    if !required_permissions.is_empty() {
-        let user_permissions = user_permissions(
-            ctx.discord(),
-            ctx.guild_id(),
-            ctx.channel_id(),
-            ctx.discord().cache.current_user_id(),
-        )
-        .await;
-        match user_permissions {
-            Some(perms) => {
-                if !perms.contains(required_permissions) {
-                    return false;
-                }
-            }
-            // better safe than sorry: when perms are unknown, restrict access
-            None => return false,
-        }
-    }
-
-    true
+    let permissions = user_permissions(ctx.discord(), ctx.guild_id(), ctx.channel_id(), user).await;
+    Some(required_permissions - permissions?)
 }
 
-async fn check_missing_bot_permissions<U, E>(
-    ctx: crate::Context<'_, U, E>,
-    required_bot_permissions: serenity::Permissions,
-) -> serenity::Permissions {
-    let user_permissions = user_permissions(
-        ctx.discord(),
-        ctx.guild_id(),
-        ctx.channel_id(),
-        ctx.discord().cache.current_user_id(),
-    )
-    .await;
-    match user_permissions {
-        Some(perms) => required_bot_permissions - perms,
-        // When in doubt, just let it run. Not getting fancy missing permissions errors is better
-        // than the command not executing at all
-        None => serenity::Permissions::empty(),
+/// Checks if the invoker is allowed to execute this command at this point in time
+#[allow(clippy::needless_lifetimes)] // false positive (clippy issue 7271)
+pub async fn check_permissions_and_cooldown<'a, U, E>(
+    ctx: crate::Context<'a, U, E>,
+    cmd: &crate::Command<U, E>,
+) -> Result<(), crate::FrameworkError<'a, U, E>> {
+    if cmd.owners_only && !ctx.framework().options().owners.contains(&ctx.author().id) {
+        return Err(crate::FrameworkError::NotAnOwner { ctx });
     }
-}
 
-pub async fn check_permissions_and_cooldown<U, E>(
-    ctx: crate::Context<'_, U, E>,
-    cmd: &crate::CommandId<U, E>,
-) -> Result<bool, (E, crate::CommandErrorLocation)> {
     // Make sure that user has required permissions
-    if !check_required_permissions_and_owners_only(ctx, cmd.required_permissions, cmd.owners_only)
-        .await
-    {
-        return Ok(false);
+    match missing_permissions(ctx, ctx.author().id, cmd.required_permissions).await {
+        Some(missing_permissions) if missing_permissions.is_empty() => {}
+        Some(missing_permissions) => {
+            return Err(crate::FrameworkError::MissingUserPermissions {
+                ctx,
+                missing_permissions: Some(missing_permissions),
+            })
+        }
+        // Better safe than sorry: when perms are unknown, restrict access
+        None => {
+            return Err(crate::FrameworkError::MissingUserPermissions {
+                ctx,
+                missing_permissions: None,
+            })
+        }
     }
 
     // Before running any pre-command checks, make sure the bot has the permissions it needs
-    let missing_bot_permissions =
-        check_missing_bot_permissions(ctx, cmd.required_bot_permissions).await;
-    if !missing_bot_permissions.is_empty() {
-        (ctx.framework().options().missing_bot_permissions_handler)(ctx, missing_bot_permissions)
-            .await
-            .map_err(|e| {
-                (
-                    e,
-                    crate::CommandErrorLocation::MissingBotPermissionsCallback,
-                )
-            })?;
-        return Ok(false);
+    let bot_user_id = ctx.discord().cache.current_user_id();
+    match missing_permissions(ctx, bot_user_id, cmd.required_bot_permissions).await {
+        Some(missing_permissions) if missing_permissions.is_empty() => {}
+        Some(missing_permissions) => {
+            return Err(crate::FrameworkError::MissingBotPermissions {
+                ctx,
+                missing_permissions,
+            })
+        }
+        // When in doubt, just let it run. Not getting fancy missing permissions errors is better
+        // than the command not executing at all
+        None => {}
     }
 
-    // Only continue if command checks returns true
-    let checks_passing = (|| async {
-        let global_check_passes = match &ctx.framework().options().command_check {
-            Some(check) => check(ctx).await?,
-            None => true,
-        };
-
-        let command_specific_check_passes = match &cmd.check {
-            Some(check) => check(ctx).await?,
-            None => true,
-        };
-
-        Ok(global_check_passes && command_specific_check_passes)
-    })()
-    .await
-    .map_err(|e| (e, crate::CommandErrorLocation::Check))?;
-    if !checks_passing {
-        return Ok(false);
+    // Only continue if command checks returns true. First perform global checks, then command
+    // checks (if necessary)
+    for check in [ctx.framework().options().command_check, cmd.check]
+        .iter()
+        .flatten()
+    {
+        match check(ctx).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(crate::FrameworkError::CommandCheckFailed { ctx, error: None })
+            }
+            Err(error) => {
+                return Err(crate::FrameworkError::CommandCheckFailed {
+                    error: Some(error),
+                    ctx,
+                })
+            }
+        }
     }
 
     let cooldowns = &cmd.cooldowns;
-    let cooldown_left = cooldowns.lock().unwrap().get_wait_time(ctx);
-    if let Some(cooldown_left) = cooldown_left {
-        if let Some(callback) = ctx.framework().options().cooldown_hit {
-            callback(ctx, cooldown_left)
-                .await
-                .map_err(|e| (e, crate::CommandErrorLocation::CooldownCallback))?;
-        }
-        return Ok(false);
+    let remaining_cooldown = cooldowns.lock().unwrap().remaining_cooldown(ctx);
+    if let Some(remaining_cooldown) = remaining_cooldown {
+        return Err(crate::FrameworkError::CooldownHit {
+            ctx,
+            remaining_cooldown,
+        });
     }
     cooldowns.lock().unwrap().start_cooldown(ctx);
 
-    Ok(true)
+    Ok(())
 }

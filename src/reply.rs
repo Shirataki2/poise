@@ -1,3 +1,8 @@
+//! Infrastructure for replying, i.e. sending a message in a command context
+//!
+//! This file dispatches to command-type specific reply code, which is in the prefix and slash
+//! modules
+
 use crate::serenity_prelude as serenity;
 
 /// Message builder that abstracts over prefix and application command responses
@@ -5,8 +10,8 @@ use crate::serenity_prelude as serenity;
 pub struct CreateReply<'a> {
     /// Message content
     pub content: Option<String>,
-    /// Embed, if present
-    pub embed: Option<serenity::CreateEmbed>,
+    /// Embeds, if present
+    pub embeds: Vec<serenity::CreateEmbed>,
     /// Message attachments
     pub attachments: Vec<serenity::AttachmentType<'a>>,
     /// Whether the message is ephemeral (only has an effect in application commands)
@@ -22,16 +27,16 @@ impl<'a> CreateReply<'a> {
         self
     }
 
-    /// Set an embed for the message.
+    /// Adds an embed to the message.
     ///
-    /// Any previously set embed will be overwritten.
+    /// Existing embeds are kept.
     pub fn embed(
         &mut self,
         f: impl FnOnce(&mut serenity::CreateEmbed) -> &mut serenity::CreateEmbed,
     ) -> &mut Self {
         let mut embed = serenity::CreateEmbed::default();
         f(&mut embed);
-        self.embed = Some(embed);
+        self.embeds.push(embed);
         self
     }
 

@@ -1,20 +1,22 @@
-// Prefix and slash specific implementation details
+//! Contains all code to dispatch incoming events onto framework commands
+
 mod common;
 mod prefix;
 mod slash;
 
-pub use prefix::dispatch_message;
+pub use prefix::{dispatch_message, find_command};
 
 use crate::serenity_prelude as serenity;
 
+/// Central event handling function of this library
 pub async fn dispatch_event<U, E>(
     framework: &crate::Framework<U, E>,
     ctx: serenity::Context,
-    event: crate::Event<'_>,
+    event: &crate::Event<'_>,
 ) where
     U: Send + Sync,
 {
-    match &event {
+    match event {
         crate::Event::Ready { data_about_bot } => {
             let user_data_setup = Option::take(&mut *framework.user_data_setup.lock().unwrap());
             if let Some(user_data_setup) = user_data_setup {
@@ -22,7 +24,9 @@ pub async fn dispatch_event<U, E>(
                     Ok(user_data) => {
                         let _: Result<_, _> = framework.user_data.set(user_data);
                     }
-                    Err(e) => (framework.options.on_error)(e, crate::ErrorContext::Setup).await,
+                    Err(error) => {
+                        (framework.options.on_error)(crate::FrameworkError::Setup { error }).await
+                    }
                 }
             } else {
                 // discarding duplicate Discord bot ready event
@@ -30,18 +34,10 @@ pub async fn dispatch_event<U, E>(
             }
         }
         crate::Event::Message { new_message } => {
-            if let Err(Some((err, ctx))) =
+            if let Err(Some((error, command))) =
                 prefix::dispatch_message(framework, &ctx, new_message, false, false).await
             {
-                if let Some(on_error) = ctx.command.id.on_error {
-                    (on_error)(err, crate::CommandErrorContext::Prefix(ctx)).await;
-                } else {
-                    (framework.options.on_error)(
-                        err,
-                        crate::ErrorContext::Command(crate::CommandErrorContext::Prefix(ctx)),
-                    )
-                    .await;
-                }
+                command.on_error.unwrap_or(framework.options.on_error)(error).await;
             }
         }
         crate::Event::MessageUpdate { event, .. } => {
@@ -52,17 +48,11 @@ pub async fn dispatch_event<U, E>(
                 );
 
                 if let Some((msg, previously_tracked)) = msg {
-                    if let Err(Some((err, ctx))) =
+                    if let Err(Some((error, command))) =
                         prefix::dispatch_message(framework, &ctx, &msg, true, previously_tracked)
                             .await
                     {
-                        let ctx = crate::CommandErrorContext::Prefix(ctx);
-                        if let Some(on_error) = ctx.command().id().on_error {
-                            on_error(err, ctx).await;
-                        } else {
-                            (framework.options.on_error)(err, crate::ErrorContext::Command(ctx))
-                                .await;
-                        }
+                        command.on_error.unwrap_or(framework.options.on_error)(error).await;
                     }
                 }
             }
@@ -70,7 +60,7 @@ pub async fn dispatch_event<U, E>(
         crate::Event::InteractionCreate {
             interaction: serenity::Interaction::ApplicationCommand(interaction),
         } => {
-            if let Err(Some((e, error_ctx))) = slash::dispatch_interaction(
+            if let Err(Some((error, command))) = slash::dispatch_interaction(
                 framework,
                 &ctx,
                 interaction,
@@ -78,23 +68,13 @@ pub async fn dispatch_event<U, E>(
             )
             .await
             {
-                if let Some(on_error) = error_ctx.ctx.command.id().on_error {
-                    on_error(e, crate::CommandErrorContext::Application(error_ctx)).await;
-                } else {
-                    (framework.options.on_error)(
-                        e,
-                        crate::ErrorContext::Command(crate::CommandErrorContext::Application(
-                            error_ctx,
-                        )),
-                    )
-                    .await;
-                }
+                command.on_error.unwrap_or(framework.options.on_error)(error).await;
             }
         }
         crate::Event::InteractionCreate {
             interaction: serenity::Interaction::Autocomplete(interaction),
         } => {
-            if let Err(Some((e, error_ctx))) = slash::dispatch_autocomplete(
+            if let Err(Some((error, command))) = slash::dispatch_autocomplete(
                 framework,
                 &ctx,
                 interaction,
@@ -102,12 +82,7 @@ pub async fn dispatch_event<U, E>(
             )
             .await
             {
-                if let Some(on_error) = error_ctx.ctx.command.id().on_error {
-                    on_error(e, crate::CommandErrorContext::Application(error_ctx)).await;
-                } else {
-                    (framework.options.on_error)(e, crate::ErrorContext::Autocomplete(error_ctx))
-                        .await;
-                }
+                command.on_error.unwrap_or(framework.options.on_error)(error).await;
             }
         }
         _ => {}
@@ -115,9 +90,10 @@ pub async fn dispatch_event<U, E>(
 
     // Do this after the framework's Ready handling, so that get_user_data() doesnt
     // potentially block infinitely
-    if let Err(e) =
-        (framework.options.listener)(&ctx, &event, framework, framework.get_user_data().await).await
+    if let Err(error) =
+        (framework.options.listener)(&ctx, event, framework, framework.user_data().await).await
     {
-        (framework.options.on_error)(e, crate::ErrorContext::Listener(&event)).await;
+        let error = crate::FrameworkError::Listener { error, event };
+        (framework.options.on_error)(error).await;
     }
 }

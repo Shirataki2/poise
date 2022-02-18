@@ -1,22 +1,10 @@
+//! Parsing code for [`KeyValueArgs`], a prefix-specific command parameter type
+
 use super::*;
 
 /// A command parameter type for key-value args
 ///
-/// For example `key1=value1 key2="value2 with spaces"`.
-///
-/// ```rust
-/// use poise::PopArgument;
-///
-/// let string = r#"key1=value key2="value with spaces" "key with spaces"="value with \"quotes\"""#;
-/// let key_value_args = poise::KeyValueArgs::pop_from(&poise::ArgString(string)).unwrap().1;
-///
-/// let mut expected_result = std::collections::HashMap::new();
-/// expected_result.insert("key1".into(), "value".into());
-/// expected_result.insert("key2".into(), "value with spaces".into());
-/// expected_result.insert("key with spaces".into(), r#"value with "quotes""#.into());
-///
-/// assert_eq!(key_value_args.0, expected_result);
-/// ```
+/// For example `key1=value1 key2="value2 with spaces"`
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct KeyValueArgs(pub std::collections::HashMap<String, String>);
 
@@ -26,12 +14,11 @@ impl KeyValueArgs {
         self.0.get(key).map(|x| x.as_str())
     }
 
-    fn pop_single_key_value_pair<'a>(
-        args: &ArgString<'a>,
-    ) -> Option<(ArgString<'a>, (String, String))> {
+    /// Reads a single key value pair ("key=value") from the front of the arguments
+    fn pop_single_key_value_pair(args: &str) -> Option<(&str, (String, String))> {
         // TODO: share quote parsing machinery with PopArgumentAsync impl for String
 
-        if args.0.is_empty() {
+        if args.is_empty() {
             return None;
         }
 
@@ -39,7 +26,7 @@ impl KeyValueArgs {
         let mut inside_string = false;
         let mut escaping = false;
 
-        let mut chars = args.0.trim_start().chars();
+        let mut chars = args.trim_start().chars();
         loop {
             let c = chars.next()?;
             if escaping {
@@ -53,32 +40,45 @@ impl KeyValueArgs {
                 escaping = true;
             } else if !inside_string && c == '=' {
                 break;
+            } else if !inside_string && c.is_ascii_punctuation() {
+                // If not enclosed in quotes, keys mustn't contain special characters.
+                // Otherwise this command invocation: "?eval `0..=5`" is parsed as key-value args
+                // with key "`0.." and value "5`". (This was a long-standing issue in rustbot)
+                return None;
             } else {
                 key.push(c);
             }
         }
 
-        let args = ArgString(chars.as_str());
+        let args = chars.as_str();
         // `args` used to contain "key=value ...", now it contains "value ...", so pop the value off
-        let (args, value) = String::pop_from(&args).unwrap_or((args, String::new()));
+        let (args, value) = super::pop_string(args).unwrap_or((args, String::new()));
 
         Some((args, (key, value)))
     }
-}
 
-impl<'a> PopArgument<'a> for KeyValueArgs {
-    type Err = std::convert::Infallible;
-
-    fn pop_from(args: &ArgString<'a>) -> Result<(ArgString<'a>, Self), Self::Err> {
+    /// Reads as many key-value args as possible from the front of the string and produces a
+    /// [`KeyValueArgs`] out of those
+    fn pop_from(mut args: &str) -> (&str, Self) {
         let mut pairs = std::collections::HashMap::new();
 
-        let mut args = args.clone();
-        while let Some((new_args, (key, value))) = Self::pop_single_key_value_pair(&args) {
-            args = new_args;
+        while let Some((remaining_args, (key, value))) = Self::pop_single_key_value_pair(args) {
+            args = remaining_args;
             pairs.insert(key, value);
         }
 
-        Ok((args, Self(pairs)))
+        (args, Self(pairs))
+    }
+}
+
+#[async_trait::async_trait]
+impl<'a> PopArgument<'a> for KeyValueArgs {
+    async fn pop_from(
+        args: &'a str,
+        _: &serenity::Context,
+        _: &serenity::Message,
+    ) -> Result<(&'a str, Self), (Box<dyn std::error::Error + Send + Sync>, Option<String>)> {
+        Ok(Self::pop_from(args))
     }
 }
 
@@ -104,7 +104,7 @@ fn test_key_value_args() {
         (r#"dummyval"#, &[], "dummyval"),
         (r#"dummyval="#, &[("dummyval", "")], ""),
     ] {
-        let (args, kv_args) = KeyValueArgs::pop_from(&ArgString(string)).unwrap();
+        let (args, kv_args) = KeyValueArgs::pop_from(string);
 
         assert_eq!(
             kv_args.0,
@@ -113,6 +113,6 @@ fn test_key_value_args() {
                 .map(|&(k, v)| (k.to_owned(), v.to_owned()))
                 .collect(),
         );
-        assert_eq!(args.0, remaining_args);
+        assert_eq!(args, remaining_args);
     }
 }

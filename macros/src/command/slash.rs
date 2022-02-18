@@ -1,69 +1,59 @@
+use super::{wrap_option, Invocation};
 use syn::spanned::Spanned as _;
 
-use super::{extract_option_type, extract_vec_type, Invocation};
-
-fn generate_options(inv: &Invocation) -> proc_macro2::TokenStream {
-    let ephemeral = inv.more.ephemeral;
-    quote::quote! {
-        ::poise::ApplicationCommandOptions {
-            ephemeral: #ephemeral,
+// ngl this is ugly
+// transforms a type of form `OuterType<T>` into `T`
+fn extract_type_parameter<'a>(outer_type: &str, t: &'a syn::Type) -> Option<&'a syn::Type> {
+    if let syn::Type::Path(path) = t {
+        if path.path.segments.len() == 1 {
+            let path = &path.path.segments[0];
+            if path.ident == outer_type {
+                if let syn::PathArguments::AngleBracketed(generics) = &path.arguments {
+                    if generics.args.len() == 1 {
+                        if let syn::GenericArgument::Type(t) = &generics.args[0] {
+                            return Some(t);
+                        }
+                    }
+                }
+            }
         }
     }
+    None
 }
 
-pub fn generate_slash_command_spec(
-    inv: &Invocation,
-) -> Result<proc_macro2::TokenStream, darling::Error> {
-    let command_name = &inv.command_name;
-    let description = inv.description.as_ref().ok_or_else(|| {
-        syn::Error::new(
-            inv.function.sig.span(),
-            "slash commands must have a description (doc comment)",
-        )
-    })?;
-
+pub fn generate_parameters(inv: &Invocation) -> Result<Vec<proc_macro2::TokenStream>, syn::Error> {
     let mut parameter_structs = Vec::new();
-    for param in inv.parameters {
-        let description = param.more.description.as_ref().ok_or_else(|| {
-            syn::Error::new(
+    for param in &inv.parameters {
+        if inv.args.slash_command && param.args.description.is_none() {
+            return Err(syn::Error::new(
                 param.span,
                 "slash command parameters must have a description",
-            )
-        })?;
+            ));
+        }
+        let description = wrap_option(param.args.description.as_ref());
 
-        let (mut required, type_) =
-            match extract_option_type(&param.type_).or_else(|| extract_vec_type(&param.type_)) {
-                Some(t) => (false, t),
-                None => (true, &param.type_),
-            };
+        let (mut required, type_) = match extract_type_parameter("Option", &param.type_)
+            .or_else(|| extract_type_parameter("Vec", &param.type_))
+        {
+            Some(t) => (false, t),
+            None => (true, &param.type_),
+        };
 
         // Don't require user to input a value for flags - use false as default value (see below)
-        if param.more.flag {
+        if param.args.flag {
             required = false;
         }
 
         let param_name = &param.name;
-        let autocomplete_callback = match &param.more.autocomplete {
+        let autocomplete_callback = match &param.args.autocomplete {
             Some(autocomplete_fn) => {
                 quote::quote! { Some(|
                     ctx: poise::ApplicationContext<'_, _, _>,
-                    interaction: &poise::serenity_prelude::AutocompleteInteraction,
-                    options: &[poise::serenity_prelude::ApplicationCommandInteractionDataOption],
+                    json_value: &poise::serenity::json::Value,
                 | Box::pin(async move {
-                    use ::poise::futures::{Stream, StreamExt};
+                    use ::poise::futures_util::{Stream, StreamExt};
 
-                    let choice = match options
-                        .iter()
-                        .find(|option| option.focused && option.name == stringify!(#param_name))
-                    {
-                        Some(x) => x,
-                        None => return Ok(()),
-                    };
-
-                    let json_value = choice.value
-                        .as_ref()
-                        .ok_or(::poise::SlashArgError::CommandStructureMismatch("expected argument value"))?;
-                    let partial_input = (&&&&&std::marker::PhantomData::<#type_>).extract_partial(json_value)?;
+                    let partial_input = poise::extract_autocomplete_argument!(#type_, json_value)?;
 
                     let choices_stream = ::poise::into_stream!(
                         #autocomplete_fn(ctx.into(), partial_input).await
@@ -71,39 +61,53 @@ pub fn generate_slash_command_spec(
                     let choices_json = choices_stream
                         .take(25)
                         .map(|value| poise::AutocompleteChoice::from(value))
-                        .map(|choice| serenity::json::json!({
+                        .map(|choice| poise::serenity::json::json!({
                             "name": choice.name,
-                            "value": (&&&&&std::marker::PhantomData::<#type_>).into_json(choice.value),
+                            "value": poise::autocomplete_argument_into_json!(#type_, choice.value),
                         }))
                         .collect()
                         .await;
-                    let choices_json = poise::serenity::json::Value::Array(choices_json);
 
-                    if let Err(e) = interaction
-                        .create_autocomplete_response(
-                            &ctx.discord.http,
-                            |b| b.set_choices(choices_json),
-                        )
-                        .await
-                    {
-                        println!("Warning: couldn't send autocomplete response: {}", e);
-                    }
-
-                    Ok(())
+                    let mut response = poise::serenity::builder::CreateAutocompleteResponse::default();
+                    response.set_choices(poise::serenity::json::Value::Array(choices_json));
+                    Ok(response)
                 })) }
             }
             None => quote::quote! { None },
         };
 
-        let is_autocomplete = param.more.autocomplete.is_some();
+        // We can just cast to f64 here because Discord only uses f64 precision anyways
+        let min_value_setter = match &param.args.min {
+            Some(x) => quote::quote! { o.min_number_value(#x as f64); },
+            None => quote::quote! {},
+        };
+        let max_value_setter = match &param.args.max {
+            Some(x) => quote::quote! { o.max_number_value(#x as f64); },
+            None => quote::quote! {},
+        };
+        let type_setter = match inv.args.slash_command {
+            true => quote::quote! { Some(|o| {
+                poise::create_slash_argument!(#type_, o);
+                #min_value_setter #max_value_setter
+            }) },
+            false => quote::quote! { None },
+        };
+
+        let channel_types = match &param.args.channel_types {
+            Some(super::List(channel_types)) => quote::quote! { Some(
+                vec![ #( poise::serenity_prelude::ChannelType::#channel_types ),* ]
+            ) },
+            None => quote::quote! { None },
+        };
+
         parameter_structs.push((
             quote::quote! {
-                ::poise::SlashCommandParameter {
-                    builder: |o| (&&&&&std::marker::PhantomData::<#type_>).create(o)
-                        .required(#required)
-                        .name(stringify!(#param_name))
-                        .description(#description)
-                        .set_autocomplete(#is_autocomplete),
+                ::poise::CommandParameter {
+                    name: stringify!(#param_name),
+                    description: #description,
+                    required: #required,
+                    channel_types: #channel_types,
+                    type_setter: #type_setter,
                     autocomplete_callback: #autocomplete_callback,
                 }
             },
@@ -112,70 +116,78 @@ pub fn generate_slash_command_spec(
     }
     // Sort the parameters so that optional parameters come last - Discord requires this order
     parameter_structs.sort_by_key(|(_, required)| !required);
-    let parameter_structs = parameter_structs
+    Ok(parameter_structs
         .into_iter()
         .map(|(builder, _)| builder)
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>())
+}
 
+pub fn generate_slash_action(inv: &Invocation) -> proc_macro2::TokenStream {
     let param_names = inv.parameters.iter().map(|p| &p.name).collect::<Vec<_>>();
     let param_types = inv
         .parameters
         .iter()
-        .map(|p| match p.more.flag {
+        .map(|p| match p.args.flag {
             true => syn::parse_quote! { FLAG },
             false => p.type_.clone(),
         })
         .collect::<Vec<_>>();
-    let options = generate_options(inv);
-    Ok(quote::quote! {
-        ::poise::SlashCommand {
-            name: #command_name,
-            description: #description,
-            parameters: {
-                use ::poise::{SlashArgumentHack, AutocompletableHack};
-                vec![ #( #parameter_structs, )* ]
-            },
-            action: |ctx, args| Box::pin(async move {
-                // idk why this can't be put in the macro itself (where the lint is triggered) and
-                // why clippy doesn't turn off this lint inside macros in the first place
-                #[allow(clippy::needless_question_mark)]
 
-                let ( #( #param_names, )* ) = ::poise::parse_slash_args!(
-                    ctx.discord, ctx.interaction.guild_id(), ctx.interaction.channel_id(), args =>
-                    #( (#param_names: #param_types), )*
-                ).await?;
+    quote::quote! {
+        |ctx, args| Box::pin(async move {
+            // idk why this can't be put in the macro itself (where the lint is triggered) and
+            // why clippy doesn't turn off this lint inside macros in the first place
+            #[allow(clippy::needless_question_mark)]
 
-                inner(ctx.into(), #( #param_names, )*).await
-            }),
-            id: std::sync::Arc::clone(&command_id),
-            options: #options,
-        }
-    })
+            let ( #( #param_names, )* ) = ::poise::parse_slash_args!(
+                ctx.discord, ctx.interaction.guild_id(), ctx.interaction.channel_id(), args =>
+                #( (#param_names: #param_types), )*
+            ).await.map_err(|error| match error {
+                poise::SlashArgError::CommandStructureMismatch(description) => {
+                    poise::FrameworkError::CommandStructureMismatch { ctx, description }
+                },
+                poise::SlashArgError::Parse { error, input } => {
+                    poise::FrameworkError::ArgumentParse {
+                        ctx: ctx.into(),
+                        error,
+                        input: Some(input),
+                    }
+                },
+            })?;
+
+            inner(ctx.into(), #( #param_names, )*)
+                .await
+                .map_err(|error| poise::FrameworkError::Command {
+                    error,
+                    ctx: ctx.into(),
+                })
+        })
+    }
 }
 
-pub fn generate_context_menu_command_spec(
+pub fn generate_context_menu_action(
     inv: &Invocation,
-    name: &str,
-) -> Result<proc_macro2::TokenStream, darling::Error> {
-    if inv.parameters.len() != 1 {
-        return Err(syn::Error::new(
-            inv.function.sig.inputs.span(),
-            "Context menu commands require exactly one parameter",
-        )
-        .into());
-    }
-
-    let param_type = &inv.parameters[0].type_;
-
-    let options = generate_options(inv);
-    Ok(quote::quote! {
-        ::poise::ContextMenuCommand {
-            name: #name,
-            action: <#param_type as ::poise::ContextMenuParameter<_, _>>::to_action(|ctx, value| {
-                Box::pin(async move { inner(ctx.into(), value).await })
-            }),
-            id: std::sync::Arc::clone(&command_id),
-            options: #options,
+) -> Result<proc_macro2::TokenStream, syn::Error> {
+    let param_type = match &*inv.parameters {
+        [single_param] => &single_param.type_,
+        _ => {
+            return Err(syn::Error::new(
+                inv.function.sig.inputs.span(),
+                "Context menu commands require exactly one parameter",
+            ))
         }
+    };
+
+    Ok(quote::quote! {
+        <#param_type as ::poise::ContextMenuParameter<_, _>>::to_action(|ctx, value| {
+            Box::pin(async move {
+                inner(ctx.into(), value)
+                    .await
+                    .map_err(|error| poise::FrameworkError::Command {
+                        error,
+                        ctx: ctx.into(),
+                    })
+            })
+        })
     })
 }
