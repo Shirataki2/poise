@@ -59,23 +59,19 @@ pub async fn getvotes(
     Ok(())
 }
 
-/// Add two numbers
-#[poise::command(
-    prefix_command,
-    track_edits,
-    slash_command,
-    global_cooldown = 1,
-    user_cooldown = 5,
-    guild_cooldown = 2,
-    channel_cooldown = 2,
-    member_cooldown = 3
-)]
-pub async fn add(
+/// Adds multiple numbers
+#[poise::command(prefix_command, slash_command)]
+pub async fn addmultiple(
     ctx: Context<'_>,
-    #[description = "First operand"] a: f64,
-    #[description = "Second operand"] b: f32,
+    #[description = "An operand"] a: i8,
+    #[description = "An operand"] b: u64,
+    #[description = "An operand"]
+    #[min = 1234567890123456_i64]
+    #[max = 1234567890987654_i64]
+    c: i64,
 ) -> Result<(), Error> {
-    ctx.say(format!("Result: {}", a + b as f64)).await?;
+    ctx.say(format!("Result: {}", a as i128 + b as i128 + c as i128))
+        .await?;
 
     Ok(())
 }
@@ -83,9 +79,12 @@ pub async fn add(
 #[derive(Debug, poise::SlashChoiceParameter)]
 pub enum MyStringChoice {
     #[name = "The first choice"]
-    ChoiceA,
+    A,
     #[name = "The second choice"]
-    ChoiceB,
+    #[name = "A single choice can have multiple names"]
+    B,
+    // If no name is given, the variant name is used
+    C,
 }
 
 /// Dummy command to test slash command choice parameters
@@ -141,16 +140,105 @@ pub async fn boop(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Deletes the given message
-#[poise::command(
-    prefix_command,
-    slash_command,
-    required_bot_permissions = "MANAGE_MESSAGES | ADMINISTRATOR"
-)]
-pub async fn delete(
+#[poise::command(slash_command)]
+pub async fn voiceinfo(
     ctx: Context<'_>,
-    #[description = "Message to be deleted"] msg: serenity::Message,
+    #[description = "Information about a server voice channel"]
+    #[channel_types("Voice")]
+    channel: serenity::GuildChannel,
 ) -> Result<(), Error> {
-    msg.delete(ctx.discord()).await?;
+    let response = format!(
+        "\
+**Name**: {}
+**Bitrate**: {}
+**User limit**: {}
+**RTC region**: {}
+**Video quality mode**: {:?}",
+        channel.name,
+        channel.bitrate.unwrap_or_default(),
+        channel.user_limit.unwrap_or_default(),
+        channel.rtc_region.unwrap_or_default(),
+        channel
+            .video_quality_mode
+            .unwrap_or(serenity::VideoQualityMode::Unknown)
+    );
+
+    ctx.say(response).await?;
+    Ok(())
+}
+
+#[poise::command(slash_command, prefix_command, reuse_response)]
+pub async fn test_reuse_response(ctx: Context<'_>) -> Result<(), Error> {
+    let image_url = "https://raw.githubusercontent.com/serenity-rs/serenity/current/logo.png";
+    ctx.send(|b| {
+        b.content("message 1")
+            .embed(|b| b.description("embed 1").image(image_url))
+            .components(|b| {
+                b.create_action_row(|b| {
+                    b.create_button(|b| {
+                        b.label("button 1")
+                            .style(serenity::ButtonStyle::Primary)
+                            .custom_id(1)
+                    })
+                })
+            })
+    })
+    .await?;
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let image_url = "https://raw.githubusercontent.com/serenity-rs/serenity/current/examples/e09_create_message_builder/ferris_eyes.png";
+    ctx.send(|b| {
+        b.content("message 2")
+            .embed(|b| b.description("embed 2").image(image_url))
+            .components(|b| {
+                b.create_action_row(|b| {
+                    b.create_button(|b| {
+                        b.label("button 2")
+                            .style(serenity::ButtonStyle::Danger)
+                            .custom_id(2)
+                    })
+                })
+            })
+    })
+    .await?;
+
+    Ok(())
+}
+
+#[poise::command(slash_command, prefix_command)]
+pub async fn oracle(
+    ctx: Context<'_>,
+    #[description = "Take a decision"] b: bool,
+) -> Result<(), Error> {
+    if b {
+        ctx.say("You seem to be an optimistic kind of person...")
+            .await?;
+    } else {
+        ctx.say("You seem to be a pessimistic kind of person...")
+            .await?;
+    }
+    Ok(())
+}
+
+#[poise::command(prefix_command)]
+pub async fn code(
+    ctx: Context<'_>,
+    args: poise::KeyValueArgs,
+    code: poise::CodeBlock,
+) -> Result<(), Error> {
+    ctx.say(format!("Key value args: {:?}\nCode: {}", args, code))
+        .await?;
+    Ok(())
+}
+
+#[poise::command(prefix_command, slash_command)]
+pub async fn say(
+    ctx: Context<'_>,
+    #[rest]
+    #[description = "Text to say"]
+    msg: String,
+) -> Result<(), Error> {
+    ctx.say(msg).await?;
     Ok(())
 }

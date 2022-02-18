@@ -1,8 +1,16 @@
-mod slash;
-pub use slash::*;
+//! Application command argument handling code
+
+mod slash_macro;
+pub use slash_macro::*;
+
+mod slash_trait;
+pub use slash_trait::*;
 
 mod context_menu;
 pub use context_menu::*;
 
-mod autocomplete;
-pub use autocomplete::*;
+mod autocompletable;
+pub use autocompletable::*;
+
+mod into_stream;
+pub use into_stream::*;

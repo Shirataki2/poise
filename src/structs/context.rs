@@ -1,6 +1,9 @@
+//! Just contains Context and PartialContext structs
+
 use crate::serenity_prelude as serenity;
 
 /// Wrapper around either [`crate::ApplicationContext`] or [`crate::PrefixContext`]
+#[derive(Debug)]
 pub enum Context<'a, U, E> {
     /// Application command context
     Application(crate::ApplicationContext<'a, U, E>),
@@ -80,9 +83,7 @@ impl<'a, U, E> Context<'a, U, E> {
     ) -> Result<Option<crate::ReplyHandle<'a>>, serenity::Error> {
         crate::send_reply(self, builder).await
     }
-}
 
-impl<'a, U, E> Context<'a, U, E> {
     /// Return the stored [`serenity::Context`] within the underlying context type.
     pub fn discord(&self) -> &'a serenity::Context {
         match self {
@@ -132,7 +133,7 @@ impl<'a, U, E> Context<'a, U, E> {
     }
 
     /// Return the datetime of the invoking message or interaction
-    pub fn created_at(&self) -> chrono::DateTime<chrono::Utc> {
+    pub fn created_at(&self) -> serenity::Timestamp {
         match self {
             Self::Application(ctx) => ctx.interaction.id().created_at(),
             Self::Prefix(ctx) => ctx.msg.timestamp,
@@ -170,11 +171,11 @@ impl<'a, U, E> Context<'a, U, E> {
     }
 
     /// Returns a reference to the command.
-    pub fn command(&self) -> Option<crate::CommandRef<'a, U, E>> {
-        Some(match self {
-            Self::Prefix(x) => crate::CommandRef::Prefix(x.command?),
-            Self::Application(x) => crate::CommandRef::Application(x.command),
-        })
+    pub fn command(&self) -> &'a crate::Command<U, E> {
+        match self {
+            Self::Prefix(x) => x.command,
+            Self::Application(x) => x.command,
+        }
     }
 
     /// Returns the prefix this command was invoked with, or a slash (`/`), if this is an
@@ -183,6 +184,19 @@ impl<'a, U, E> Context<'a, U, E> {
         match self {
             Context::Prefix(ctx) => ctx.prefix,
             Context::Application(_) => "/",
+        }
+    }
+
+    /// Returns the command name that this command was invoked with
+    ///
+    /// Mainly useful in prefix context, for example to check whether a command alias was used.
+    ///
+    /// In slash contexts, the given command name will always be returned verbatim, since there are
+    /// no slash command aliases and the user has no control over spelling
+    pub fn invoked_command_name(&self) -> &'a str {
+        match self {
+            Self::Prefix(ctx) => ctx.invoked_command_name,
+            Self::Application(ctx) => &ctx.interaction.data().name,
         }
     }
 }

@@ -3,6 +3,7 @@
 
 use crate::serenity_prelude as serenity;
 
+/// Updates the given message according to the update event
 fn update_message(message: &mut serenity::Message, update: serenity::MessageUpdateEvent) {
     message.id = update.id;
     message.channel_id = update.channel_id;
@@ -48,8 +49,11 @@ fn update_message(message: &mut serenity::Message, update: serenity::MessageUpda
 
 /// Stores messages and the associated bot responses in order to implement poise's edit tracking
 /// feature.
+#[derive(Debug)]
 pub struct EditTracker {
+    /// Duration after which cached messages can be purged
     max_duration: std::time::Duration,
+    /// Cache, which associates user messages to the corresponding bot response message
     cache: Vec<(serenity::Message, serenity::Message)>,
 }
 
@@ -110,16 +114,25 @@ impl EditTracker {
         let max_duration = self.max_duration;
         self.cache.retain(|(user_msg, _)| {
             let last_update = user_msg.edited_timestamp.unwrap_or(user_msg.timestamp);
-            if let Ok(age) = (chrono::Utc::now() - last_update).to_std() {
-                age < max_duration
-            } else {
-                false
-            }
+            let age = serenity::Timestamp::now().unix_timestamp() - last_update.unix_timestamp();
+            age < max_duration.as_secs() as i64
         });
     }
 
     /// Given a message by a user, find the corresponding bot response, if one exists and is cached.
     pub fn find_bot_response(
+        &self,
+        user_msg_id: serenity::MessageId,
+    ) -> Option<&serenity::Message> {
+        let (_, bot_response) = self
+            .cache
+            .iter()
+            .find(|(user_msg, _)| user_msg.id == user_msg_id)?;
+        Some(bot_response)
+    }
+
+    /// Given a message by a user, find the corresponding bot response, if one exists and is cached.
+    pub fn find_bot_response_mut(
         &mut self,
         user_msg_id: serenity::MessageId,
     ) -> Option<&mut serenity::Message> {
@@ -146,31 +159,27 @@ pub async fn send_prefix_reply<'a, U, E>(
     builder(&mut reply);
     let crate::CreateReply {
         content,
-        embed,
+        embeds,
         attachments,
         components,
         ephemeral: _,
     } = reply;
 
     let lock_edit_tracker = || {
-        if let Some(command) = ctx.command {
-            // If we definitely don't need to track this command invocation, stop
-            let execute_untracked_edits = ctx
-                .framework
-                .options()
-                .prefix_options
-                .execute_untracked_edits;
-            if !(command.track_edits || execute_untracked_edits) {
-                return None;
-            }
-        }
-
-        ctx.framework
+        // If we definitely don't need to track this command invocation, stop
+        let execute_untracked_edits = ctx
+            .framework
             .options()
             .prefix_options
-            .edit_tracker
-            .as_ref()
-            .map(|t| t.write().unwrap())
+            .execute_untracked_edits;
+        if !(ctx.command.reuse_response || execute_untracked_edits) {
+            return None;
+        }
+
+        if let Some(edit_tracker) = &ctx.framework.options().prefix_options.edit_tracker {
+            return Some(edit_tracker.write().unwrap());
+        }
+        None
     };
 
     let existing_response = lock_edit_tracker()
@@ -184,10 +193,7 @@ pub async fn send_prefix_reply<'a, U, E>(
                 // Empty string resets content (happens when user replaces text with embed)
                 f.content(content.as_deref().unwrap_or(""));
 
-                match embed {
-                    Some(embed) => f.set_embed(embed),
-                    None => f.set_embeds(Vec::new()),
-                };
+                f.set_embeds(embeds);
 
                 f.0.insert("attachments", serenity::json::json! { [] }); // reset attachments
                 for attachment in attachments {
@@ -209,7 +215,7 @@ pub async fn send_prefix_reply<'a, U, E>(
         // If the entry still exists after the await, update it to the new contents
         if let Some(response_entry) = lock_edit_tracker()
             .as_mut()
-            .and_then(|t| t.find_bot_response(ctx.msg.id))
+            .and_then(|t| t.find_bot_response_mut(ctx.msg.id))
         {
             *response_entry = response.clone();
         }
@@ -223,9 +229,7 @@ pub async fn send_prefix_reply<'a, U, E>(
                 if let Some(content) = content {
                     m.content(content);
                 }
-                if let Some(embed) = embed {
-                    m.set_embed(embed);
-                }
+                m.set_embeds(embeds);
                 if let Some(allowed_mentions) = &ctx.framework.options().allowed_mentions {
                     m.allowed_mentions(|m| {
                         *m = allowed_mentions.clone();

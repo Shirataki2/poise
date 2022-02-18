@@ -1,3 +1,5 @@
+//! Infrastructure for command cooldowns
+
 use crate::serenity_prelude as serenity;
 // I usually don't really do imports, but these are very convenient
 use crate::util::OrderedMap;
@@ -24,12 +26,18 @@ pub struct CooldownConfig {
 /// cooldown handler.
 #[derive(Default, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Cooldowns {
+    /// Stores the cooldown durations
     cooldown: CooldownConfig,
 
+    /// Stores the timestamp of the last global invocation
     global_invocation: Option<Instant>,
+    /// Stores the timestamps of the last invocation per user
     user_invocations: OrderedMap<serenity::UserId, Instant>,
+    /// Stores the timestamps of the last invocation per guild
     guild_invocations: OrderedMap<serenity::GuildId, Instant>,
+    /// Stores the timestamps of the last invocation per channel
     channel_invocations: OrderedMap<serenity::ChannelId, Instant>,
+    /// Stores the timestamps of the last invocation per member (user and guild)
     member_invocations: OrderedMap<(serenity::UserId, serenity::GuildId), Instant>,
 }
 
@@ -49,7 +57,7 @@ impl Cooldowns {
 
     /// Queries the cooldown buckets and checks if all cooldowns have expired and command
     /// execution may proceed. If not, Some is returned with the remaining cooldown
-    pub fn get_wait_time<U, E>(&self, ctx: crate::Context<'_, U, E>) -> Option<Duration> {
+    pub fn remaining_cooldown<U, E>(&self, ctx: crate::Context<'_, U, E>) -> Option<Duration> {
         let mut cooldown_data = vec![
             (self.cooldown.global, self.global_invocation),
             (

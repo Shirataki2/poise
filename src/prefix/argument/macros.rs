@@ -1,9 +1,12 @@
+//! A macro that generates backtracking-capable argument parsing code, given a list of parameter
+//! types and attributes
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! _parse_prefix {
     // All arguments have been consumed
     ( $ctx:ident $msg:ident $args:ident => [ $error:ident $( $name:ident )* ] ) => {
-        if $args.0.is_empty() {
+        if $args.is_empty() {
             return Ok(( $( $name, )* ));
         }
     };
@@ -13,12 +16,12 @@ macro_rules! _parse_prefix {
         (Option<$type:ty $(,)?>)
         $( $rest:tt )*
     ) => {
-        match (&PhantomData::<$type>).pop(&$args, $ctx, $msg).await {
+        match $crate::pop_prefix_argument!($type, &$args, $ctx, $msg).await {
             Ok(($args, token)) => {
                 let token: Option<$type> = Some(token);
                 $crate::_parse_prefix!($ctx $msg $args => [ $error $($preamble)* token ] $($rest)* );
             },
-            Err(e) => $error = Box::new(e),
+            Err(e) => $error = e,
         }
         let token: Option<$type> = None;
         $crate::_parse_prefix!($ctx $msg $args => [ $error $($preamble)* token ] $($rest)* );
@@ -31,12 +34,12 @@ macro_rules! _parse_prefix {
     ) => {
         let token: Option<$type> = None;
         $crate::_parse_prefix!($ctx $msg $args => [ $error $($preamble)* token ] $($rest)* );
-        match (&PhantomData::<$type>).pop(&$args, $ctx, $msg).await {
+        match $crate::pop_prefix_argument!($type, &$args, $ctx, $msg).await {
             Ok(($args, token)) => {
                 let token: Option<$type> = Some(token);
                 $crate::_parse_prefix!($ctx $msg $args => [ $error $($preamble)* token ] $($rest)* );
             },
-            Err(e) => $error = Box::new(e),
+            Err(e) => $error = e,
         }
     };
 
@@ -45,19 +48,20 @@ macro_rules! _parse_prefix {
         (#[rest] Option<$type:ty $(,)?>)
         $( $rest:tt )*
     ) => {
-        if $args.0.trim_start().is_empty() {
+        if $args.trim_start().is_empty() {
             let token: Option<$type> = None;
             $crate::_parse_prefix!($ctx $msg $args => [ $error $($preamble)* token ]);
         } else {
+            let input = $args.trim_start();
             match <$type as $crate::serenity_prelude::ArgumentConvert>::convert(
-                $ctx, $msg.guild_id, Some($msg.channel_id), $args.0.trim_start()
+                $ctx, $msg.guild_id, Some($msg.channel_id), input
             ).await {
                 Ok(token) => {
-                    let $args = $crate::ArgString("");
+                    let $args = "";
                     let token = Some(token);
                     $crate::_parse_prefix!($ctx $msg $args => [ $error $($preamble)* token ]);
                 },
-                Err(e) => $error = Box::new(e),
+                Err(e) => $error = (e.into(), Some(input.to_owned())),
             }
         }
     };
@@ -72,14 +76,14 @@ macro_rules! _parse_prefix {
 
         let mut running_args = $args.clone();
         loop {
-            match (&PhantomData::<$type>).pop(&running_args, $ctx, $msg).await {
+            match $crate::pop_prefix_argument!($type, &running_args, $ctx, $msg).await {
                 Ok((popped_args, token)) => {
                     tokens.push(token);
                     token_rest_args.push(popped_args.clone());
                     running_args = popped_args;
                 },
                 Err(e) => {
-                    $error = Box::new(e);
+                    $error = e;
                     break;
                 }
 
@@ -101,14 +105,19 @@ macro_rules! _parse_prefix {
         // question to my former self: why the $(poise::)* ?
         (#[rest] $(poise::)* $type:ty)
     ) => {
-        match <$type as $crate::serenity_prelude::ArgumentConvert>::convert(
-            $ctx, $msg.guild_id, Some($msg.channel_id), $args.0.trim_start()
-        ).await {
-            Ok(token) => {
-                let $args = $crate::ArgString("");
-                $crate::_parse_prefix!($ctx $msg $args => [ $error $($preamble)* token ]);
-            },
-            Err(e) => $error = Box::new(e),
+        let input = $args.trim_start();
+        if input.is_empty() {
+            $error = ($crate::TooFewArguments.into(), None);
+        } else {
+            match <$type as $crate::serenity_prelude::ArgumentConvert>::convert(
+                $ctx, $msg.guild_id, Some($msg.channel_id), input
+            ).await {
+                Ok(token) => {
+                    let $args = "";
+                    $crate::_parse_prefix!($ctx $msg $args => [ $error $($preamble)* token ]);
+                },
+                Err(e) => $error = (e.into(), Some(input.to_owned())),
+            }
         }
     };
 
@@ -117,13 +126,17 @@ macro_rules! _parse_prefix {
         (#[flag] $name:literal)
         $( $rest:tt )*
     ) => {
-        if let Ok(($args, token)) = (&PhantomData::<String>).pop(&$args, $ctx, $msg).await {
-            if token.eq_ignore_ascii_case($name) {
+        match $crate::pop_prefix_argument!(String, &$args, $ctx, $msg).await {
+            Ok(($args, token)) if token.eq_ignore_ascii_case($name) => {
                 $crate::_parse_prefix!($ctx $msg $args => [ $error $($preamble)* true ] $($rest)* );
+            },
+            // only allow backtracking if the flag didn't match: it's confusing for the user if they
+            // precisely set the flag but it's ignored
+            _ => {
+                $error = (concat!("Must use either `", $name, "` or nothing as a modifier").into(), None);
+                $crate::_parse_prefix!($ctx $msg $args => [ $error $($preamble)* false ] $($rest)* );
             }
         }
-        $error = concat!("Must use either `", $name, "` or nothing as a modifier").into();
-        $crate::_parse_prefix!($ctx $msg $args => [ $error $($preamble)* false ] $($rest)* );
     };
 
     // Consume T
@@ -131,11 +144,11 @@ macro_rules! _parse_prefix {
         ($type:ty)
         $( $rest:tt )*
     ) => {
-        match (&PhantomData::<$type>).pop(&$args, $ctx, $msg).await {
+        match $crate::pop_prefix_argument!($type, &$args, $ctx, $msg).await {
             Ok(($args, token)) => {
                 $crate::_parse_prefix!($ctx $msg $args => [ $error $($preamble)* token ] $($rest)* );
             },
-            Err(e) => $error = Box::new(e),
+            Err(e) => $error = e,
         }
     };
 
@@ -168,7 +181,7 @@ assert_eq!(
     poise::parse_prefix_args!(
         &ctx, &msg,
         "one two three four" => (String), (Option<u32>), #[rest] (String)
-    ).await?,
+    ).await.unwrap(),
     (
         String::from("one"),
         None,
@@ -180,7 +193,7 @@ assert_eq!(
     poise::parse_prefix_args!(
         &ctx, &msg,
         "1 2 3 4" => (String), (Option<u32>), #[rest] (String)
-    ).await?,
+    ).await.unwrap(),
     (
         String::from("1"),
         Some(2),
@@ -198,14 +211,14 @@ macro_rules! parse_prefix_args {
         ( $($type:tt)* )
     ),* $(,)? ) => {
         async {
-            use std::marker::PhantomData;
-            use $crate::PrefixArgumentHack as _;
+            use $crate::PopArgument as _;
 
             let ctx = $ctx;
             let msg = $msg;
-            let args = $crate::ArgString($args);
+            let args = $args;
 
-            let mut error = Box::new($crate::TooManyArguments) as Box<dyn std::error::Error + Send + Sync>;
+            let mut error: (Box<dyn std::error::Error + Send + Sync>, Option<String>)
+                = (Box::new($crate::TooManyArguments) as _, None);
 
             $crate::_parse_prefix!(
                 ctx msg args => [error]
@@ -213,7 +226,7 @@ macro_rules! parse_prefix_args {
                     ($( #[$attr] )? $($type)*)
                 )*
             );
-            Err($crate::ArgumentParseError(error))
+            Err(error)
         }
     };
 }
@@ -293,11 +306,12 @@ mod test {
                 .unwrap(),
             ("a".into(), "b c".into()),
         );
-        assert_eq!(
+        assert!(
             parse_prefix_args!(&ctx, &msg, "hello" => #[flag] ("hello"), #[rest] (String))
                 .await
-                .unwrap(),
-            (true, "".into())
+                .unwrap_err()
+                .0
+                .is::<crate::TooFewArguments>(),
         );
         assert_eq!(
             parse_prefix_args!(&ctx, &msg, "helloo" => #[flag] ("hello"), #[rest] (String))

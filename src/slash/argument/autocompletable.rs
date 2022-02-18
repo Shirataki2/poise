@@ -1,13 +1,39 @@
+//! A struct and trait and an instance of the auto-deref specialization trick for the purposes of
+//! converting between Discord's autocomplete data and Rust types, in order to run the parameter
+//! autocomplete callbacks
+
 #[allow(unused_imports)] // required if serenity simdjson feature is enabled
 use crate::serenity::json::prelude::*;
 use crate::{serenity_prelude as serenity, SlashArgError};
 use std::convert::{TryFrom, TryInto};
 use std::marker::PhantomData;
 
+/// A single autocomplete choice, displayed in Discord UI
+///
+/// This type should be returned by functions set via the `#[autocomplete = ]` attribute on slash
+/// command parameters.
+pub struct AutocompleteChoice<T> {
+    /// Name of the choice, displayed in the Discord UI
+    pub name: String,
+    /// Value of the choice, sent to the bot
+    pub value: T,
+}
+
+impl<T: ToString> From<T> for AutocompleteChoice<T> {
+    fn from(value: T) -> Self {
+        Self {
+            name: value.to_string(),
+            value,
+        }
+    }
+}
+
 /// Types that can be marked autocompletable in a slash command parameter.
 ///
 /// Includes almost all types that can be used as a slash command parameter in general,
 /// except some built-in model types (User, Member, Role...)
+// Note to self: this CANNOT be integrated into SlashArgumentHack because some types (User, Channel,
+// etc.) cannot be used for autocomplete!
 pub trait Autocompletable {
     /// Type of the partial input. This should be `Self` except in cases where a partial input
     /// cannot be parsed into `Self` (e.g. an IP address)
@@ -16,11 +42,15 @@ pub trait Autocompletable {
     /// Try extracting the partial input from the JSON value
     ///
     /// Equivalent to [`crate::SlashArgument::extract`]
+    ///
+    /// Don't call this method directly! Use [`crate::extract_autocomplete_argument!`]
     fn extract_partial(value: &serenity::json::Value) -> Result<Self::Partial, SlashArgError>;
 
     /// Serialize an autocompletion choice as a JSON value.
     ///
     /// This is the counterpart to [`Self::extract_partial`]
+    ///
+    /// Don't call this method directly! Use [`crate::autocomplete_argument_into_json!`]
     fn into_json(self) -> serenity::json::Value;
 }
 
@@ -32,6 +62,27 @@ pub trait AutocompletableHack<T> {
         -> Result<Self::Partial, SlashArgError>;
 
     fn into_json(self, value: T) -> serenity::json::Value;
+}
+
+/// Full version of [`crate::Autocompletable::extract_partial`].
+///
+/// Uses specialization to get full coverage of types. Pass the type as the first argument
+#[macro_export]
+macro_rules! extract_autocomplete_argument {
+    ($target:ty, $value:expr) => {{
+        use $crate::AutocompletableHack as _;
+        (&&&&&std::marker::PhantomData::<$target>).extract_partial($value)
+    }};
+}
+/// Full version of [`crate::Autocompletable::into_json`].
+///
+/// Uses specialization to get full coverage of types. Pass the type as the first argument
+#[macro_export]
+macro_rules! autocomplete_argument_into_json {
+    ($target:ty, $value:expr) => {{
+        use $crate::AutocompletableHack as _;
+        (&&&&&std::marker::PhantomData::<$target>).into_json($value)
+    }};
 }
 
 /// Handles arbitrary types that can be parsed from string.
@@ -67,7 +118,7 @@ impl<T: TryFrom<i64> + Into<serenity::json::Value> + Send + Sync> Autocompletabl
             .as_i64()
             .ok_or(SlashArgError::CommandStructureMismatch("expected integer"))?
             .try_into()
-            .map_err(|_| SlashArgError::IntegerOutOfBounds)
+            .map_err(|_| SlashArgError::CommandStructureMismatch("received out of bounds integer"))
     }
 
     fn into_json(self, value: T) -> serenity::json::Value {

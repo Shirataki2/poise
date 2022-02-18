@@ -1,3 +1,5 @@
+//! A builder struct that allows easy and readable creation of a [`crate::Framework`]
+
 use crate::serenity_prelude as serenity;
 use crate::BoxFuture;
 
@@ -11,6 +13,7 @@ use crate::BoxFuture;
 /// Before starting, the builder will make an HTTP request to retrieve the bot's application ID and
 /// owner.
 pub struct FrameworkBuilder<U, E> {
+    /// Callback for user data setup
     user_data_setup: Option<
         Box<
             dyn Send
@@ -22,15 +25,16 @@ pub struct FrameworkBuilder<U, E> {
                 ) -> BoxFuture<'a, Result<U, E>>,
         >,
     >,
+    /// Framework options
     options: Option<crate::FrameworkOptions<U, E>>,
-    client_settings:
-        Option<Box<dyn FnOnce(serenity::ClientBuilder) -> serenity::ClientBuilder>>,
+    /// Client settings that will be applied to the ClientBuilder before initializing the framework
+    client_settings: Option<Box<dyn FnOnce(serenity::ClientBuilder) -> serenity::ClientBuilder>>,
+    /// Discord bot token
     token: Option<String>,
-    intents: Option<serenity::GatewayIntents>,
-    commands: Vec<(
-        crate::CommandDefinition<U, E>,
-        Box<dyn FnOnce(&mut crate::CommandBuilder<U, E>) -> &mut crate::CommandBuilder<U, E>>,
-    )>,
+    /// List of framework commands
+    commands: Vec<crate::Command<U, E>>,
+    /// See [`Self::initialize_owners()`]
+    initialize_owners: bool,
 }
 
 impl<U, E> Default for FrameworkBuilder<U, E> {
@@ -40,8 +44,8 @@ impl<U, E> Default for FrameworkBuilder<U, E> {
             options: Default::default(),
             client_settings: Default::default(),
             token: Default::default(),
-            intents: Default::default(),
             commands: Default::default(),
+            initialize_owners: true,
         }
     }
 }
@@ -49,11 +53,13 @@ impl<U, E> Default for FrameworkBuilder<U, E> {
 impl<U, E> FrameworkBuilder<U, E> {
     /// Set a prefix for commands
     #[deprecated = "Please set the prefix via FrameworkOptions::prefix_options::prefix"]
+    #[must_use]
     pub fn prefix(self, _prefix: impl Into<String>) -> Self {
         panic!("Please set the prefix via FrameworkOptions::prefix_options::prefix");
     }
 
     /// Set a callback to be invoked to create the user data instance
+    #[must_use]
     pub fn user_data_setup<F>(mut self, user_data_setup: F) -> Self
     where
         F: Send
@@ -70,6 +76,7 @@ impl<U, E> FrameworkBuilder<U, E> {
     }
 
     /// Configure framework options
+    #[must_use]
     pub fn options(mut self, options: crate::FrameworkOptions<U, E>) -> Self {
         self.options = Some(options);
         self
@@ -80,6 +87,7 @@ impl<U, E> FrameworkBuilder<U, E> {
     ///
     /// Note: the builder's token will be overridden by the
     /// [`FrameworkBuilder`]; use [`FrameworkBuilder::token`] to supply a token.
+    #[must_use]
     pub fn client_settings(
         mut self,
         f: impl FnOnce(serenity::ClientBuilder) -> serenity::ClientBuilder + 'static,
@@ -89,19 +97,22 @@ impl<U, E> FrameworkBuilder<U, E> {
     }
 
     /// The bot token
+    #[must_use]
     pub fn token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
         self
     }
 
     /// Add a new command to the framework
+    #[deprecated = "supply commands in FrameworkOptions directly with `commands: vec![...]`"]
+    #[must_use]
     pub fn command(
         mut self,
-        definition: crate::CommandDefinition<U, E>,
-        meta_builder: impl FnOnce(&mut crate::CommandBuilder<U, E>) -> &mut crate::CommandBuilder<U, E>
-            + 'static,
+        mut command: crate::Command<U, E>,
+        meta_builder: impl FnOnce(&mut crate::Command<U, E>) -> &mut crate::Command<U, E> + 'static,
     ) -> Self {
-        self.commands.push((definition, Box::new(meta_builder)));
+        meta_builder(&mut command);
+        self.commands.push(command);
         self
     }
 
@@ -121,15 +132,22 @@ impl<U, E> FrameworkBuilder<U, E> {
     ///     // framework startup...
     /// # ;
     /// ```
+    #[deprecated = "supply commands in FrameworkOptions directly with `commands: vec![...]`"]
+    #[must_use]
     pub fn commands(
         mut self,
-        commands: impl IntoIterator<Item = fn() -> crate::CommandDefinition<U, E>> + 'static,
+        commands: impl IntoIterator<Item = fn() -> crate::Command<U, E>> + 'static,
     ) -> Self {
-        // Can't use Vec::extend() due to ??? compile errors
-        for command in commands {
-            let definition = (command)();
-            self.commands.push((definition, Box::new(|f| f)));
-        }
+        self.commands.extend(commands.into_iter().map(|c| c()));
+        self
+    }
+
+    /// Whether to add this bot application's owner and team members to
+    /// [`crate::FrameworkOptions::owners`] automatically
+    ///
+    /// `true` by default
+    pub fn initialize_owners(&mut self, initialize_owners: bool) -> &mut Self {
+        self.initialize_owners = initialize_owners;
         self
     }
 
@@ -153,31 +171,30 @@ impl<U, E> FrameworkBuilder<U, E> {
             .get_current_application_info()
             .await?;
 
-        // Build framework options by concatenating user-set options with commands and owner
-        for (command, meta_builder) in self.commands {
-            options.command(command, meta_builder);
+        // Build framework options by concatenating user-set options with commands and owners
+        options.commands.extend(self.commands);
+        if self.initialize_owners {
+            options.owners.insert(application_info.owner.id);
+            if let Some(team) = application_info.team {
+                for member in team.members {
+                    // This `if` currently always evaluates to true but it becomes important once
+                    // Discord implements more team roles than Admin
+                    if member.permissions.iter().any(|p| p == "*") {
+                        options.owners.insert(member.user.id);
+                    }
+                }
+            }
         }
-        options.owners.insert(application_info.owner.id);
 
         // Create serenity client
-        let mut client_builder = serenity::ClientBuilder::new(token)
-            .application_id(application_info.id.0)
-            .intents(
-                self.intents
-                    .unwrap_or_else(serenity::GatewayIntents::non_privileged),
-            );
+        let mut client_builder =
+            serenity::ClientBuilder::new(token).application_id(application_info.id.0);
         if let Some(client_settings) = self.client_settings {
             client_builder = client_settings(client_builder);
         }
 
         // Create framework with specified settings
-        crate::Framework::new(
-            serenity::ApplicationId(application_info.id.0),
-            client_builder,
-            user_data_setup,
-            options,
-        )
-        .await
+        crate::Framework::new(client_builder, user_data_setup, options).await
     }
 
     /// Start the framework with the specified configuration.
@@ -190,5 +207,14 @@ impl<U, E> FrameworkBuilder<U, E> {
         E: Send + 'static,
     {
         self.build().await?.start().await
+    }
+
+    /// Autosharded version of [`Self::run`]
+    pub async fn run_autosharded(self) -> Result<(), serenity::Error>
+    where
+        U: Send + Sync + 'static,
+        E: Send + 'static,
+    {
+        self.build().await?.start_autosharded().await
     }
 }

@@ -7,22 +7,20 @@ pub use builder::*;
 
 use crate::{serenity_prelude as serenity, BoxFuture};
 
-pub use dispatch::dispatch_message;
+pub use dispatch::{dispatch_message, find_command};
 
 /// The main framework struct which stores all data and handles message and interaction dispatch.
 pub struct Framework<U, E> {
+    /// Stores user data. Is initialized on first Ready event
     user_data: once_cell::sync::OnceCell<U>,
-    // TODO: wrap in RwLock to allow changing framework options while running? Could also replace
-    // the edit tracking cache interior mutability
+    /// Stores the framework options
     options: crate::FrameworkOptions<U, E>,
-    application_id: serenity::ApplicationId,
 
-    // Will be initialized to Some on construction, and then taken out on startup
+    /// Will be initialized to Some on construction, and then taken out on startup
     client: std::sync::Mutex<Option<serenity::Client>>,
-    // Initialized to Some during construction; so shouldn't be None at any observable point
-    shard_manager:
-        std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Mutex<serenity::ShardManager>>>>,
-    // Filled with Some on construction. Taken out and executed on first Ready gateway event
+    /// Initialized to Some during construction; so shouldn't be None at any observable point
+    shard_manager: std::sync::Arc<tokio::sync::Mutex<serenity::ShardManager>>,
+    /// Filled with Some on construction. Taken out and executed on first Ready gateway event
     user_data_setup: std::sync::Mutex<
         Option<
             Box<
@@ -55,10 +53,9 @@ impl<U, E> Framework<U, E> {
     /// data setup is not allowed to return Result because there would be no reasonable
     /// course of action on error.
     pub async fn new<F>(
-        application_id: serenity::ApplicationId,
         client_builder: serenity::ClientBuilder,
         user_data_setup: F,
-        options: crate::FrameworkOptions<U, E>,
+        mut options: crate::FrameworkOptions<U, E>,
     ) -> Result<std::sync::Arc<Self>, serenity::Error>
     where
         F: Send
@@ -77,45 +74,65 @@ impl<U, E> Framework<U, E> {
 
         let client_builder = register(client_builder);
 
-        let self_1 = std::sync::Arc::new(Self {
-            user_data: once_cell::sync::OnceCell::new(),
-            user_data_setup: std::sync::Mutex::new(Some(Box::new(user_data_setup))),
-            // To break up the circular dependency (framework setup -> client setup -> event handler
-            // -> framework), we initialize this with None and then immediately fill in once the
-            // client is created
-            client: std::sync::Mutex::new(None),
-            options,
-            application_id,
-            shard_manager: std::sync::Mutex::new(None),
-        });
-        let self_2 = self_1.clone();
+        // let self_1 = std::sync::Arc::new(Self {
+        //     user_data: once_cell::sync::OnceCell::new(),
+        //     user_data_setup: std::sync::Mutex::new(Some(Box::new(user_data_setup))),
+        //     // To break up the circular dependency (framework setup -> client setup -> event handler
+        //     // -> framework), we initialize this with None and then immediately fill in once the
+        //     // client is created
+        //     client: std::sync::Mutex::new(None),
+        //     options,
+        //     application_id,
+        //     shard_manager: std::sync::Mutex::new(None),
+        // });
+        // let self_2 = self_1.clone();
+        use std::sync::{Arc, Mutex};
 
+        /// Fill in [`Command::qualified_name`] with the correct values
+        fn set_qualified_names<U, E>(command: &mut crate::Command<U, E>) {
+            for subcommand in &mut command.subcommands {
+                subcommand.qualified_name =
+                    format!("{} {}", command.qualified_name, subcommand.name);
+                set_qualified_names(subcommand);
+            }
+        }
+        for command in &mut options.commands {
+            set_qualified_names(command);
+        }
+
+        let framework_cell = Arc::new(once_cell::sync::OnceCell::<Arc<Self>>::new());
+        let framework_cell_2 = framework_cell.clone();
         let event_handler = crate::EventWrapper(move |ctx, event| {
-            let self_2 = self_2.clone();
-            Box::pin(async move { dispatch::dispatch_event(&*self_2, ctx, event).await }) as _
+            // unwrap_used: we will only receive events once the client has been started, by which
+            // point framework_cell has been initialized
+            #[allow(clippy::unwrap_used)]
+            let framework = framework_cell_2.get().unwrap().clone();
+            Box::pin(async move { dispatch::dispatch_event(&*framework, ctx, &event).await }) as _
         });
 
-        let client: serenity::Client = client_builder
-            .application_id(application_id.0)
-            .event_handler(event_handler)
-            .await?;
+        let client: serenity::Client = client_builder.event_handler(event_handler).await?;
 
-        *self_1.shard_manager.lock().unwrap() = Some(client.shard_manager.clone());
-        *self_1.client.lock().unwrap() = Some(client);
-
-        Ok(self_1)
+        let framework = Arc::new(Self {
+            user_data: once_cell::sync::OnceCell::new(),
+            user_data_setup: Mutex::new(Some(Box::new(user_data_setup))),
+            options,
+            shard_manager: client.shard_manager.clone(),
+            client: Mutex::new(Some(client)),
+        });
+        let _: Result<_, _> = framework_cell.set(framework.clone());
+        Ok(framework)
     }
 
-    /// Start the framework.
-    ///
-    /// Takes a `serenity::ClientBuilder`, in which you need to supply the bot token, as well as
-    /// any gateway intents.
-    pub async fn start(self: std::sync::Arc<Self>) -> Result<(), serenity::Error>
+    /// Small utility function for starting the framework that is agnostic over client sharding
+    async fn start_with<F: std::future::Future<Output = serenity::Result<()>>>(
+        self: std::sync::Arc<Self>,
+        start: fn(serenity::Client) -> F,
+    ) -> Result<(), serenity::Error>
     where
         U: Send + Sync + 'static,
         E: Send + 'static,
     {
-        let mut client = self
+        let client = self
             .client
             .lock()
             .unwrap()
@@ -133,11 +150,31 @@ impl<U, E> Framework<U, E> {
         });
 
         // This will run for as long as the bot is active
-        client.start().await?;
+        start(client).await?;
 
         edit_track_cache_purge_task.abort();
 
         Ok(())
+    }
+
+    /// Starts the framework.
+    pub async fn start(self: std::sync::Arc<Self>) -> Result<(), serenity::Error>
+    where
+        U: Send + Sync + 'static,
+        E: Send + 'static,
+    {
+        self.start_with(|mut c| async move { c.start().await })
+            .await
+    }
+
+    /// Starts the framework. Calls [`serenity::Client::start_autosharded`] internally
+    pub async fn start_autosharded(self: std::sync::Arc<Self>) -> Result<(), serenity::Error>
+    where
+        U: Send + Sync + 'static,
+        E: Send + 'static,
+    {
+        self.start_with(|mut c| async move { c.start_autosharded().await })
+            .await
     }
 
     /// Return the stored framework options, including commands.
@@ -145,63 +182,14 @@ impl<U, E> Framework<U, E> {
         &self.options
     }
 
-    /// Returns the application ID given to the framework on its creation.
-    pub fn application_id(&self) -> serenity::ApplicationId {
-        self.application_id
-    }
-
     /// Returns the serenity's client shard manager.
     pub fn shard_manager(&self) -> std::sync::Arc<tokio::sync::Mutex<serenity::ShardManager>> {
-        self.shard_manager
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("fatal: shard manager not stored in framework initialization")
+        self.shard_manager.clone()
     }
 
-    /// Yields an iterator over all unique commands in this framework. Different command
-    /// types are grouped together if they belong to the same command definition.
-    ///
-    /// Only top-level commands are included, i.e. no subcommands
-    pub fn commands(&self) -> impl Iterator<Item = crate::CommandDefinitionRef<'_, U, E>> {
-        type CommandMap<'s, U, E> =
-            crate::util::OrderedMap<*const (), crate::CommandDefinitionRef<'s, U, E>>;
-
-        fn get_command<'a, 's, U, E>(
-            map: &'a mut CommandMap<'s, U, E>,
-            id: &std::sync::Arc<crate::CommandId<U, E>>,
-        ) -> &'a mut crate::CommandDefinitionRef<'s, U, E> {
-            map.get_or_insert_with(std::sync::Arc::as_ptr(id) as _, || {
-                crate::CommandDefinitionRef {
-                    prefix: None,
-                    slash: None,
-                    context_menu: None,
-                    id: id.clone(),
-                }
-            })
-        }
-
-        let mut map = CommandMap::new();
-        for command in &self.options().prefix_options.commands {
-            get_command(&mut map, &command.command.id).prefix = Some(command);
-        }
-        for command in &self.options().application_options.commands {
-            match command {
-                crate::ApplicationCommandTree::Slash(command) => {
-                    get_command(&mut map, command.id()).slash = Some(command)
-                }
-                crate::ApplicationCommandTree::ContextMenu(command) => {
-                    get_command(&mut map, &command.id).context_menu = Some(command)
-                }
-            }
-        }
-
-        map.into_iter().map(|(_k, v)| v)
-    }
-
-    async fn get_user_data(&self) -> &U {
-        // We shouldn't get a Message event before a Ready event. But if we do, wait until
-        // the Ready event does come and the resulting data has arrived.
+    /// Retrieves user data, or blocks until it has been initialized (once the Ready event has been
+    /// received).
+    pub async fn user_data(&self) -> &U {
         loop {
             match self.user_data.get() {
                 Some(x) => break x,

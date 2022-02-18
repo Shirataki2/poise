@@ -8,6 +8,8 @@ pub use argument::*;
 
 use crate::serenity_prelude as serenity;
 
+/// Sends the message, specified via [`crate::CreateReply`], to the interaction initial response
+/// endpoint
 fn send_as_initial_response(
     data: crate::CreateReply<'_>,
     allowed_mentions: Option<&serenity::CreateAllowedMentions>,
@@ -15,8 +17,8 @@ fn send_as_initial_response(
 ) {
     let crate::CreateReply {
         content,
-        embed,
-        attachments: _, // discord doesn't support attachments in initial response :(
+        embeds,
+        attachments: _, // serenity doesn't support attachments in initial response yet
         components,
         ephemeral,
     } = data;
@@ -24,9 +26,7 @@ fn send_as_initial_response(
     if let Some(content) = content {
         f.content(content);
     }
-    if let Some(embed) = embed {
-        f.add_embed(embed);
-    }
+    f.embeds(embeds);
     if let Some(allowed_mentions) = allowed_mentions {
         f.allowed_mentions(|f| {
             *f = allowed_mentions.clone();
@@ -44,6 +44,8 @@ fn send_as_initial_response(
     }
 }
 
+/// Sends the message, specified via [`crate::CreateReply`], to the interaction followup response
+/// endpoint
 fn send_as_followup_response<'a>(
     data: crate::CreateReply<'a>,
     allowed_mentions: Option<&serenity::CreateAllowedMentions>,
@@ -51,7 +53,7 @@ fn send_as_followup_response<'a>(
 ) {
     let crate::CreateReply {
         content,
-        embed,
+        embeds,
         attachments,
         components,
         ephemeral,
@@ -60,9 +62,7 @@ fn send_as_followup_response<'a>(
     if let Some(content) = content {
         f.content(content);
     }
-    if let Some(embed) = embed {
-        f.add_embed(embed);
-    }
+    f.embeds(embeds);
     if let Some(components) = components {
         f.components(|c| {
             c.0 = components.0;
@@ -81,6 +81,39 @@ fn send_as_followup_response<'a>(
     f.add_files(attachments);
 }
 
+/// Sends the message, specified via [`crate::CreateReply`], to the interaction initial response
+/// edit endpoint
+fn send_as_edit<'a>(
+    data: crate::CreateReply<'a>,
+    allowed_mentions: Option<&serenity::CreateAllowedMentions>,
+    f: &mut serenity::EditInteractionResponse,
+) {
+    let crate::CreateReply {
+        content,
+        embeds,
+        attachments: _, // no support for attachment edits in serenity yet
+        components,
+        ephemeral: _, // can't edit ephemerality in retrospect
+    } = data;
+
+    if let Some(content) = content {
+        f.content(content);
+    }
+    f.set_embeds(embeds);
+    if let Some(components) = components {
+        f.components(|c| {
+            c.0 = components.0;
+            c
+        });
+    }
+    if let Some(allowed_mentions) = allowed_mentions {
+        f.allowed_mentions(|f| {
+            *f = allowed_mentions.clone();
+            f
+        });
+    }
+}
+
 /// Send a response to an interaction (slash command or context menu command invocation).
 ///
 /// If a response to this interaction has already been sent, a
@@ -97,7 +130,7 @@ pub async fn send_application_reply<'a, U, E>(
     };
 
     let mut data = crate::CreateReply {
-        ephemeral: ctx.command.options().ephemeral,
+        ephemeral: ctx.command.ephemeral,
         ..Default::default()
     };
     builder(&mut data);
@@ -108,12 +141,21 @@ pub async fn send_application_reply<'a, U, E>(
 
     let allowed_mentions = ctx.framework.options().allowed_mentions.as_ref();
     if has_sent_initial_response {
-        interaction
-            .create_followup_message(ctx.discord, |f| {
-                send_as_followup_response(data, allowed_mentions, f);
-                f
-            })
-            .await?;
+        if ctx.command.reuse_response {
+            interaction
+                .edit_original_interaction_response(ctx.discord, |f| {
+                    send_as_edit(data, allowed_mentions, f);
+                    f
+                })
+                .await?;
+        } else {
+            interaction
+                .create_followup_message(ctx.discord, |f| {
+                    send_as_followup_response(data, allowed_mentions, f);
+                    f
+                })
+                .await?;
+        }
     } else {
         interaction
             .create_interaction_response(ctx.discord, |r| {
