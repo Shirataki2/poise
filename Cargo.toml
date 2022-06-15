@@ -24,7 +24,8 @@ features = ["builder", "cache", "client", "gateway", "model", "utils", "unstable
 # version = "0.10.5"
 
 git = "https://github.com/serenity-rs/serenity"
-branch = "next"
+# branch = "next"
+rev = "bae3319"
 
 # git = "https://github.com/kangalioo/serenity"
 # branch = "poise-tailored"
